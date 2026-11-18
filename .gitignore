@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+.pytest_cache/
+
+# Local ytm auth/cache if ever placed in repo
+headers_auth.json
+stream_cache.json
+state.json

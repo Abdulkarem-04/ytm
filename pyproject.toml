@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ytm"
+version = "0.1.0"
+description = "High-contrast terminal music player backed by YouTube Music and mpv"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "ytmusicapi>=1.8.0",
+    "yt-dlp>=2024.1.0",
+    "textual>=0.80.0",
+    "rich>=13.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+ytm = "ytm.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
