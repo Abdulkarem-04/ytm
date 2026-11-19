@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import textwrap
 import threading
 import time
 from pathlib import Path
@@ -13,7 +14,10 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
-from textual.widgets import DataTable, Input, Static
+from textual.markup import escape as title_escape
+from textual.screen import ModalScreen
+from textual.widgets import DataTable, Input, OptionList, Static
+from textual.widgets.option_list import Option
 
 from ytm.api import YTMClient
 from ytm.art import CoverArtRenderer
@@ -21,10 +25,12 @@ from ytm.cache_worker import BackgroundCacheManager, clean_error_text
 from ytm.config import MUSIC_DIR
 from ytm.downloader import TrackDownloader, dir_stats
 from ytm.liked import LikedStore
+from ytm.lyrics import LyricsData, LyricsProvider, active_line_index
 from ytm.models import Track, format_duration
 from ytm.player import MPVError, MPVPlayer
 from ytm.playlists import PlaylistStore
 from ytm.settings import SettingsStore
+from ytm.spectrum import PipeWireSpectrumAnalyzer
 
 _AUDIO_EXTS = {".opus", ".m4a", ".webm", ".mp3", ".ogg", ".flac", ".wav"}
 _VIEW_ORDER = ("queue", "search", "liked", "local", "playlists", "settings")
@@ -34,6 +40,8 @@ _SETTINGS_KEYS = (
     "preload_limit",
     "audio_quality",
     "stream_buffer_secs",
+    "mpris_enabled",
+    "spectrum_mode",
     "clear_preload",
     "restart_daemon",
     "local_stats",
@@ -70,6 +78,107 @@ def _build_progress_markup(position: float, duration: float, width: int = 34) ->
     left = "━" * filled
     right = "─" * max(0, width - 1 - filled)
     return f"[#00ff87]{left}[/][bold #ffd43b]●[/][#4c6ef5]{right}[/]"
+
+
+_NEW_PLAYLIST_SENTINEL = "\x00new"
+
+_MODAL_CSS = """
+PlaylistPickerModal {
+    align: center middle;
+    background: rgba(0, 0, 0, 0.7);
+}
+
+#modal-box {
+    width: 52;
+    height: auto;
+    max-height: 22;
+    background: #000000;
+    border: round #ff4d94;
+    padding: 0 1;
+}
+
+#modal-list {
+    height: auto;
+    max-height: 14;
+    background: #000000;
+    color: #ffffff;
+    border: none;
+}
+
+#modal-list > .option-list--option-highlighted {
+    background: #103252;
+    color: #ffffff;
+    text-style: bold;
+}
+
+#modal-hint {
+    background: #000000;
+    color: #00e5ff;
+}
+"""
+
+
+class PlaylistPickerModal(ModalScreen[str | None]):
+    """Compact high-contrast picker that returns the chosen playlist name."""
+
+    DEFAULT_CSS = _MODAL_CSS
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("j", "down", "Down"),
+        Binding("k", "up", "Up"),
+        Binding("c", "new_playlist", "New"),
+    ] + [Binding(str(n), f"quick_pick({n})", f"Pick {n}") for n in range(1, 10)]
+
+    def __init__(self, names: list[str], active: str | None, track_title: str) -> None:
+        super().__init__()
+        self.names = names
+        self.active = active
+        self.track_title = track_title
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="modal-box"):
+            options = []
+            for idx, name in enumerate(self.names):
+                num = f"{idx + 1}" if idx < 9 else " "
+                options.append(Option(Text.assemble((f"{num}  ", "bold #ffd43b"), (name, "bold #ffffff"))))
+            yield OptionList(*options, id="modal-list")
+            yield Static(
+                "[bold #ffd43b]j/k[/] move  [bold #ffd43b]Enter[/] add  [bold #ffd43b]1-9[/] quick  "
+                "[bold #ffd43b]c[/] new  [bold #ffd43b]Esc[/] cancel",
+                id="modal-hint",
+            )
+
+    def on_mount(self) -> None:
+        box = self.query_one("#modal-box", Vertical)
+        box.border_title = f"Add to playlist: {title_escape(_truncate(self.track_title, 30))}"
+        option_list = self.query_one("#modal-list", OptionList)
+        if self.active in self.names:
+            option_list.highlighted = self.names.index(self.active)
+        elif self.names:
+            option_list.highlighted = 0
+        option_list.focus()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        if 0 <= event.option_index < len(self.names):
+            self.dismiss(self.names[event.option_index])
+
+    def action_down(self) -> None:
+        self.query_one("#modal-list", OptionList).action_cursor_down()
+
+    def action_up(self) -> None:
+        self.query_one("#modal-list", OptionList).action_cursor_up()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_new_playlist(self) -> None:
+        self.dismiss(_NEW_PLAYLIST_SENTINEL)
+
+    def action_quick_pick(self, number: int) -> None:
+        idx = int(number) - 1
+        if 0 <= idx < len(self.names):
+            self.dismiss(self.names[idx])
 
 
 class YTMApp(App[None]):
@@ -155,33 +264,37 @@ class YTMApp(App[None]):
         layout: vertical;
     }
 
-    #track-table, #settings-table {
+    #track-table, #settings-table, #playlist-folders-table {
         height: 1fr;
         background: #000000;
         color: #ffffff;
     }
 
-    #settings-table {
+    #settings-table, #playlist-folders-table {
         display: none;
     }
 
-    #track-table > .datatable--header, #settings-table > .datatable--header {
+    #track-table > .datatable--header, #settings-table > .datatable--header,
+    #playlist-folders-table > .datatable--header {
         background: #0a1428;
         color: #ffd43b;
         text-style: bold;
     }
 
-    #track-table > .datatable--cursor, #settings-table > .datatable--cursor {
+    #track-table > .datatable--cursor, #settings-table > .datatable--cursor,
+    #playlist-folders-table > .datatable--cursor {
         background: #103252;
         color: #ffffff;
         text-style: bold;
     }
 
-    #track-table > .datatable--even-row, #settings-table > .datatable--even-row {
+    #track-table > .datatable--even-row, #settings-table > .datatable--even-row,
+    #playlist-folders-table > .datatable--even-row {
         background: #05080f;
     }
 
-    #track-table > .datatable--odd-row, #settings-table > .datatable--odd-row {
+    #track-table > .datatable--odd-row, #settings-table > .datatable--odd-row,
+    #playlist-folders-table > .datatable--odd-row {
         background: #000000;
     }
 
@@ -222,11 +335,60 @@ class YTMApp(App[None]):
         border: round #ff4d94;
         padding: 0 1;
     }
+
+    #focus-stage {
+        height: 1fr;
+        background: #000000;
+        layout: vertical;
+        display: none;
+    }
+
+    #focus-upper {
+        height: 16;
+        background: #000000;
+        layout: horizontal;
+    }
+
+    #focus-cover-box {
+        width: 32;
+        height: 16;
+        background: #000000;
+        border: round #00e5ff;
+        padding: 0 1;
+    }
+
+    #focus-now-playing {
+        width: 1fr;
+        height: 16;
+        background: #000000;
+        border: round #00ff87;
+        padding: 1 2;
+    }
+
+    #focus-lyrics-box {
+        width: 1.3fr;
+        height: 16;
+        background: #000000;
+        border: round #ffd43b;
+        padding: 0 1;
+        display: none;
+    }
+
+    #focus-spectrum-box {
+        height: 1fr;
+        min-height: 7;
+        background: #000000;
+        border: round #ff4d94;
+        padding: 0 1;
+    }
     """
 
     BINDINGS = [
         Binding("slash", "focus_search", "Search", priority=True),
+        Binding("backslash", "focus_filter", "Filter"),
         Binding("escape", "focus_table", "Track List", priority=True),
+        Binding("z", "toggle_focus_mode", "Focus Mode"),
+        Binding("y", "toggle_lyrics", "Lyrics"),
         Binding("1", "view_queue", "Queue"),
         Binding("2", "view_search", "Search"),
         Binding("3", "view_liked", "Liked"),
@@ -245,6 +407,11 @@ class YTMApp(App[None]):
         Binding("n", "next_track", "Next"),
         Binding("p", "prev_track", "Prev"),
         Binding("r", "replay_track", "Replay"),
+        Binding("S", "toggle_shuffle", "Shuffle"),
+        Binding("w", "cycle_repeat", "Repeat"),
+        Binding("backspace", "go_back", "Back"),
+        Binding("h", "go_back", "Back"),
+        Binding("e", "rename_playlist", "Rename Playlist"),
         Binding("l", "like_current", "Like Playing"),
         Binding("L", "like_selected", "Like Selected"),
         Binding("x", "remove_selected", "Remove"),
@@ -276,6 +443,8 @@ class YTMApp(App[None]):
         art_renderer: CoverArtRenderer | None = None,
         settings_store: SettingsStore | None = None,
         cache_manager: BackgroundCacheManager | None = None,
+        lyrics_provider: LyricsProvider | None = None,
+        initial_focus: bool = False,
         music_dir: Path = MUSIC_DIR,
     ) -> None:
         super().__init__()
@@ -293,6 +462,7 @@ class YTMApp(App[None]):
             settings_store=self.settings_store,
         )
         self.art_renderer = art_renderer or CoverArtRenderer()
+        self.lyrics_provider = lyrics_provider or LyricsProvider(client=self.client)
         self.cache_manager = cache_manager or BackgroundCacheManager(
             downloader=self.downloader,
             player=self.player,
@@ -321,6 +491,26 @@ class YTMApp(App[None]):
         self._input_mode: str = "search"
         self._last_remove_ts: float = 0.0
         self._cover_video_id: str | None = None
+        self._focus_cover_video_id: str | None = None
+        self.spectrum_analyzer = PipeWireSpectrumAnalyzer(band_count=_BAND_COUNT)
+
+        self.focus_mode: bool = bool(initial_focus)
+        self.lyrics_visible: bool = False
+        self._current_lyrics: LyricsData | None = None
+        self._lyrics_video_id: str | None = None
+        self._lyrics_loading_id: str | None = None
+        self._lyrics_missing_ids: set[str] = set()
+        self._lyrics_scroll_offset: int = 0
+
+        self.shuffle_on: bool = self.player.load_shuffle()
+        self.repeat_mode: str = self.player.load_repeat_mode()
+        self.playlist_summaries: list[dict[str, Any]] = []
+        self._playlist_browse_mode: str = "folders"
+        self._folders_signature: tuple[Any, ...] | None = None
+        self._filter_text: str = ""
+        self._rename_target: str | None = None
+        self._pending_add_track: Track | None = None
+        self._pending_delete_playlist: tuple[str, float] | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="top-bar"):
@@ -340,6 +530,7 @@ class YTMApp(App[None]):
             with Vertical(id="main-pane"):
                 yield DataTable(id="track-table", cursor_type="row", zebra_stripes=True)
                 yield DataTable(id="settings-table", cursor_type="row", zebra_stripes=True)
+                yield DataTable(id="playlist-folders-table", cursor_type="row", zebra_stripes=True)
                 yield Static(
                     "[#00e5ff]Ready.[/] Press [bold #ffd43b]/[/] to search, "
                     "[bold #ffd43b]c[/] new playlist, [bold #ffd43b]6[/] settings, [bold #ffd43b]q[/] detach.",
@@ -351,6 +542,13 @@ class YTMApp(App[None]):
             yield Static("", id="now-playing-box")
             yield Static("", id="visualizer-box")
 
+        with Vertical(id="focus-stage"):
+            with Horizontal(id="focus-upper"):
+                yield Static("", id="focus-cover-box")
+                yield Static("", id="focus-now-playing")
+                yield Static("", id="focus-lyrics-box")
+            yield Static("", id="focus-spectrum-box")
+
     def on_mount(self) -> None:
         self.query_one("#nav-panel", Static).border_title = "|> Views"
         self.query_one("#keys-panel", Static).border_title = "Keybindings"
@@ -360,6 +558,13 @@ class YTMApp(App[None]):
         self.query_one("#now-playing-box", Static).border_title = "|> Now Playing"
         self.query_one("#visualizer-box", Static).border_title = "Spectrum"
 
+        focus_cover = self.query_one("#focus-cover-box", Static)
+        focus_cover.border_title = "Cover"
+        focus_cover.update(self.art_renderer.placeholder_markup(width=28, height_cells=14))
+        self.query_one("#focus-now-playing", Static).border_title = "|> Focus Player"
+        self.query_one("#focus-lyrics-box", Static).border_title = "Lyrics"
+        self.query_one("#focus-spectrum-box", Static).border_title = "Spectrum"
+
         table = self.query_one("#track-table", DataTable)
         table.add_columns("#", "Title", "Artist", "Album", "Duration")
 
@@ -367,21 +572,49 @@ class YTMApp(App[None]):
         settings_table.add_columns("Setting", "Value", "Description")
         settings_table.display = False
 
-        table.focus()
+        folders_table = self.query_one("#playlist-folders-table", DataTable)
+        folders_table.add_columns("#", "Playlist", "Tracks", "Local", "Status")
+        folders_table.display = False
+
+        if self.focus_mode:
+            self._apply_focus_layout()
+        else:
+            table.focus()
 
         self._reload_collections()
         self._refresh_status_tick()
         self._tick_visualizer()
         self.cache_manager.start()
+        if not self.is_headless and self.settings_store.load().spectrum_mode == "fft":
+            self.spectrum_analyzer.start()
+        if self.player.is_running():
+            self._run_bg(self.player._maybe_start_mpris)
 
         self.set_interval(0.25, self._refresh_status_tick)
-        self.set_interval(0.08, self._tick_visualizer)
+        self.set_interval(0.05, self._tick_visualizer)
 
     def on_unmount(self) -> None:
+        self.spectrum_analyzer.stop()
         self.cache_manager.stop()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if isinstance(self.screen, ModalScreen):
+            return False
         if isinstance(self.focused, Input) and action != "focus_table":
+            return False
+        if self.focus_mode and action in {
+            "play_selected",
+            "play_view_queue",
+            "start_radio",
+            "like_selected",
+            "remove_selected",
+            "add_selected_to_playlist",
+            "download_selected",
+            "open_selected_playlist",
+            "rename_playlist",
+            "go_back",
+            "activate_setting",
+        }:
             return False
         return True
 
@@ -393,11 +626,15 @@ class YTMApp(App[None]):
                 "[bold #ffd43b]Enter[/]   [#ffffff]Play[/]    [bold #ffd43b]R[/]   [#ffffff]Radio[/]",
                 "[bold #ffd43b]a[/]       [#ffffff]ViewQ[/]   [bold #ffd43b]Spc[/] [#ffffff]Pause[/]",
                 "[bold #ffd43b]n / p[/]   [#ffffff]Next / Prev[/]",
+                "[bold #ffd43b]S / w[/]   [#ffffff]Shuffle / Repeat[/]",
+                "[bold #ffd43b]z / y[/]   [#ffffff]Focus / Lyrics[/]",
+                "[bold #ffd43b]\\[/]       [#ffffff]Filter (offline)[/]",
                 "[bold #ffd43b]r[/]       [#ffffff]Replay (00:00)[/]",
                 "[bold #ffd43b]l / L[/]   [#ffffff]Add Like (No Del)[/]",
                 "[bold #ffd43b]x / u[/]   [#ffffff]Remove / Undo Like[/]",
                 "[bold #ffd43b]c / m[/]   [#ffffff]New / Add Playlist[/]",
                 "[bold #ffd43b], / .[/]   [#ffffff]Switch Playlist[/]",
+                "[bold #ffd43b]e / h[/]   [#ffffff]Rename PL / Back[/]",
                 "[bold #ffd43b]d / s[/]   [#ffffff]Cache / Sync YTM[/]",
                 "[bold #ffd43b]\\[ ] - +[/] [#ffffff]Seek/Vol[/] [bold #ffd43b]q/Q[/] [#ffffff]Quit[/]",
             ]
@@ -448,8 +685,39 @@ class YTMApp(App[None]):
         self.queue_tracks = self.player.load_queue()
         self.liked_tracks = self.liked_store.list_tracks()
         self.playlist_tracks = self.liked_store.annotate(self.playlist_store.get_tracks())
+        self.playlist_summaries = self.playlist_store.list_summaries()
         self.local_tracks = self._scan_local_tracks()
         self.liked_store.annotate(self.search_tracks)
+
+    def _in_folders_mode(self) -> bool:
+        return self.active_view == "playlists" and self._playlist_browse_mode == "folders"
+
+    def _filter_active(self) -> bool:
+        return bool(self._filter_text.strip())
+
+    def _visible_rows(self) -> list[tuple[int, Track]]:
+        """Return (real_index, track) pairs for the current view after the offline filter."""
+        tracks = self._current_view_tracks()
+        needle = self._filter_text.strip().lower()
+        if not needle:
+            return list(enumerate(tracks))
+        return [
+            (idx, t)
+            for idx, t in enumerate(tracks)
+            if needle in t.title.lower() or needle in t.artist.lower() or needle in (t.album or "").lower()
+        ]
+
+    def _visible_folders(self) -> list[tuple[int, dict[str, Any]]]:
+        needle = self._filter_text.strip().lower()
+        rows = list(enumerate(self.playlist_summaries))
+        if not needle:
+            return rows
+        return [(idx, s) for idx, s in rows if needle in str(s["name"]).lower()]
+
+    def _filter_suffix(self, shown: int, total: int) -> str:
+        if not self._filter_active():
+            return ""
+        return f'  // filter "{title_escape(self._filter_text.strip())}" {shown}/{total}'
 
     def _current_view_tracks(self) -> list[Track]:
         if self.active_view == "queue":
@@ -471,8 +739,10 @@ class YTMApp(App[None]):
         if self.active_view == "liked":
             return "|> [3] Liked Music"
         if self.active_view == "playlists":
-            pl_name = self.playlist_store.get_active_name() or "None"
-            return f"|> [5] Playlist: {pl_name}"
+            if self._playlist_browse_mode == "folders":
+                return f"|> [5] Playlists ({len(self.playlist_summaries)})"
+            pl_name = title_escape(self.playlist_store.get_active_name() or "None")
+            return f"|> [5] Playlists / {pl_name}  (Esc: back)"
         if self.active_view == "settings":
             return "|> [6] Settings"
         return "|> [4] Local Cache"
@@ -484,7 +754,7 @@ class YTMApp(App[None]):
             ("search", "2", "Search Results", len(self.search_tracks)),
             ("liked", "3", "Liked Music", len(self.liked_tracks)),
             ("local", "4", "Local Cache", len(self.local_tracks)),
-            ("playlists", "5", "Playlists", len(self.playlist_tracks)),
+            ("playlists", "5", "Playlists", len(self.playlist_summaries)),
             ("settings", "6", "Settings", None),
         ]
         lines: list[str] = []
@@ -538,6 +808,16 @@ class YTMApp(App[None]):
         preload_val = "[ON]" if settings.preload_next else "[OFF]"
         preload_style = "bold #00ff87" if settings.preload_next else "bold #ff4d94"
         quality_val = "Data Saver (<=96k)" if settings.audio_quality == "saver" else "Best Audio"
+        mpris_val = "[ON]" if settings.mpris_enabled else "[OFF]"
+        mpris_style = "bold #00ff87" if settings.mpris_enabled else "bold #ff4d94"
+        spec_labels = {
+            "fft": ("Live Audio (PipeWire FFT)", "bold #00ff87"),
+            "simulated": ("Simulated Wave", "bold #ffd43b"),
+            "off": ("Off", "bold #ff4d94"),
+        }
+        spec_val, spec_style = spec_labels.get(
+            settings.spectrum_mode, (settings.spectrum_mode, "bold #ffd43b")
+        )
         preload_mb = preload_bytes / (1024 * 1024)
         local_mb = local_bytes / (1024 * 1024)
 
@@ -568,6 +848,16 @@ class YTMApp(App[None]):
                 "mpv RAM readahead buffer + auto-reconnect",
             ),
             (
+                "MPRIS Media Keys",
+                Text(mpris_val, style=mpris_style),
+                "Global Play/Pause/Next/Prev across keyboards and KDE Plasma",
+            ),
+            (
+                "Spectrum Mode",
+                Text(spec_val, style=spec_style),
+                "Beat-reactive volume-independent FFT or simulated wave",
+            ),
+            (
                 "[Action] Clear Temp Preload",
                 Text(f"{preload_count} files ({preload_mb:.1f} MB)", style="bold #00e5ff"),
                 "Delete temporary files in ~/.cache/ytm/preload",
@@ -594,8 +884,56 @@ class YTMApp(App[None]):
         table.move_cursor(row=target_row)
         self._update_nav_panel()
 
+    def _refresh_folders_table(self, force: bool = False) -> None:
+        visible = self._visible_folders()
+        total = len(self.playlist_summaries)
+        sig = (
+            self._filter_text.strip().lower(),
+            tuple((s["name"], s["count"], s["local"], s["active"]) for s in self.playlist_summaries),
+        )
+        if not force and sig == self._folders_signature:
+            return
+        self._folders_signature = sig
+
+        main_pane = self.query_one("#main-pane", Vertical)
+        main_pane.border_title = self._view_title() + self._filter_suffix(len(visible), total)
+
+        table = self.query_one("#playlist-folders-table", DataTable)
+        prev_row = table.cursor_row
+        table.clear()
+
+        for real_idx, item in visible:
+            is_active = bool(item["active"])
+            num_text = Text(
+                f"|>{real_idx + 1}" if is_active else str(real_idx + 1),
+                style="bold #00ff87" if is_active else "bold #ffd43b",
+            )
+            name_text = Text(
+                f"[DIR] {_truncate(str(item['name']), 34)}",
+                style="bold #00ff87" if is_active else "bold #ffffff",
+            )
+            count_text = Text(f"{item['count']} tracks", style="#00e5ff")
+            local_text = Text(f"{item['local']} local", style="#00ff87")
+            status_text = (
+                Text("[ACTIVE]", style="bold #ff4d94")
+                if is_active
+                else Text("-", style="#4c6ef5")
+            )
+            table.add_row(num_text, name_text, count_text, local_text, status_text)
+
+        if visible:
+            target_row = max(0, min(prev_row, len(visible) - 1))
+            table.move_cursor(row=target_row)
+
+        self._update_nav_panel()
+
     def _refresh_table(self, force: bool = False) -> None:
+        if self._in_folders_mode():
+            self._refresh_folders_table(force=force)
+            return
+
         tracks = self._current_view_tracks()
+        visible = self._visible_rows()
         current_track: Track | None = self.last_status.get("current_track")
         current_vid = current_track.video_id if current_track else None
         active_idx = self.active_queue_pos if self.active_view == "queue" else -1
@@ -606,6 +944,7 @@ class YTMApp(App[None]):
             active_pl,
             active_idx,
             current_vid if self.active_view != "queue" else None,
+            self._filter_text.strip().lower(),
             tuple((t.video_id, t.title, t.is_liked, bool(t.local_path)) for t in tracks),
         )
         if not force and sig == self._table_signature:
@@ -613,19 +952,19 @@ class YTMApp(App[None]):
         self._table_signature = sig
 
         main_pane = self.query_one("#main-pane", Vertical)
-        main_pane.border_title = self._view_title()
+        main_pane.border_title = self._view_title() + self._filter_suffix(len(visible), len(tracks))
 
         table = self.query_one("#track-table", DataTable)
         prev_row = table.cursor_row
         table.clear()
 
-        for idx, track in enumerate(tracks):
+        for real_idx, track in visible:
             if self.active_view == "queue":
-                is_active = idx == self.active_queue_pos
+                is_active = real_idx == self.active_queue_pos
             else:
                 is_active = current_vid is not None and track.video_id == current_vid
             num_text = Text(
-                f"|>{idx + 1}" if is_active else str(idx + 1),
+                f"|>{real_idx + 1}" if is_active else str(real_idx + 1),
                 style="bold #00ff87" if is_active else "bold #ffd43b",
             )
             suffix_len = (8 if track.is_liked else 0) + (8 if track.local_path else 0)
@@ -644,8 +983,8 @@ class YTMApp(App[None]):
             dur_text = Text(track.duration, style="#00ff87")
             table.add_row(num_text, title_text, artist_text, album_text, dur_text)
 
-        if tracks:
-            target_row = max(0, min(prev_row, len(tracks) - 1))
+        if visible:
+            target_row = max(0, min(prev_row, len(visible) - 1))
             table.move_cursor(row=target_row)
 
         self._update_nav_panel()
@@ -653,35 +992,303 @@ class YTMApp(App[None]):
     def _set_status(self, message: str) -> None:
         self.query_one("#main-status", Static).update(message)
 
+    def _apply_focus_layout(self) -> None:
+        if not self.is_mounted:
+            return
+        show_focus = bool(self.focus_mode)
+        for widget_id in ("#top-bar", "#search-bar", "#workspace", "#bottom-dock"):
+            self.query_one(widget_id).display = not show_focus
+        focus_stage = self.query_one("#focus-stage", Vertical)
+        focus_stage.display = show_focus
+        focus_stage.can_focus = show_focus
+        self.query_one("#focus-lyrics-box").display = show_focus and self.lyrics_visible
+        self.query_one("#search-input", Input).can_focus = not show_focus
+        if show_focus:
+            focus_stage.focus()
+        else:
+            self._apply_table_visibility().focus()
+        self.call_after_refresh(self._sync_focus_widgets_after_refresh)
+
     def _update_cover_art(self, track: Track | None) -> None:
         cover_box = self.query_one("#cover-box", Static)
+        focus_cover = self.query_one("#focus-cover-box", Static)
         if track is None or not track.video_id:
             if self._cover_video_id is not None:
                 self._cover_video_id = None
                 cover_box.update(self.art_renderer.placeholder_markup())
+            if self._focus_cover_video_id is not None:
+                self._focus_cover_video_id = None
+                focus_cover.update(self.art_renderer.placeholder_markup(width=28, height_cells=14))
             return
 
         vid = track.video_id
-        if vid == self._cover_video_id:
+        if vid != self._cover_video_id:
+            self._cover_video_id = vid
+            cached = self.art_renderer.get_cached_markup(vid, width=14, height_cells=7)
+            if cached is not None:
+                cover_box.update(cached)
+            else:
+                cover_box.update(self.art_renderer.placeholder_markup())
+
+                def _fetch_small() -> None:
+                    markup = self.art_renderer.fetch_and_render(vid, width=14, height_cells=7)
+
+                    def _apply_small() -> None:
+                        if self._cover_video_id == vid:
+                            self.query_one("#cover-box", Static).update(markup)
+
+                    self._safe_ui(_apply_small)
+
+                self._run_bg(_fetch_small)
+
+        if self.focus_mode and vid != self._focus_cover_video_id:
+            self._focus_cover_video_id = vid
+            cached_big = self.art_renderer.get_cached_markup(vid, width=28, height_cells=14)
+            if cached_big is not None:
+                focus_cover.update(cached_big)
+            else:
+                focus_cover.update(self.art_renderer.placeholder_markup(width=28, height_cells=14))
+
+                def _fetch_big() -> None:
+                    markup = self.art_renderer.fetch_and_render(vid, width=28, height_cells=14)
+
+                    def _apply_big() -> None:
+                        if self._focus_cover_video_id == vid:
+                            self.query_one("#focus-cover-box", Static).update(markup)
+
+                    self._safe_ui(_apply_big)
+
+                self._run_bg(_fetch_big)
+
+    def _ensure_lyrics_for_track(self, track: Track | None) -> None:
+        if track is None or not track.video_id:
+            self._lyrics_video_id = None
+            self._current_lyrics = None
+            self._lyrics_loading_id = None
+            self._lyrics_scroll_offset = 0
             return
-        self._cover_video_id = vid
-        cached = self.art_renderer.get_cached_markup(vid)
-        if cached is not None:
-            cover_box.update(cached)
+
+        vid = track.video_id
+        if vid != self._lyrics_video_id:
+            self._lyrics_video_id = vid
+            self._lyrics_scroll_offset = 0
+            self._current_lyrics = self.lyrics_provider.get_cached(vid)
+
+        if (
+            self.lyrics_visible
+            and self._current_lyrics is None
+            and self._lyrics_loading_id != vid
+            and vid not in self._lyrics_missing_ids
+        ):
+            cached = self.lyrics_provider.get_cached(vid)
+            if cached is not None:
+                self._current_lyrics = cached
+                return
+
+            self._lyrics_loading_id = vid
+
+            def _fetch_lyrics_bg() -> None:
+                data = self.lyrics_provider.fetch(track)
+
+                def _apply_lyrics() -> None:
+                    if self._lyrics_loading_id == vid:
+                        self._lyrics_loading_id = None
+                    if data is None:
+                        self._lyrics_missing_ids.add(vid)
+                    else:
+                        self._lyrics_missing_ids.discard(vid)
+                    if self._lyrics_video_id == vid:
+                        self._current_lyrics = data
+                        self._lyrics_scroll_offset = 0
+                        self._render_lyrics_panel(self.last_status)
+
+                self._safe_ui(_apply_lyrics)
+
+            self._run_bg(_fetch_lyrics_bg)
+
+    def _render_lyrics_panel(self, status: dict[str, Any]) -> None:
+        if not self.is_mounted or not self.focus_mode or not self.lyrics_visible:
+            return
+        lyrics_box = self.query_one("#focus-lyrics-box", Static)
+        running = bool(status.get("running"))
+        track: Track | None = status.get("current_track")
+
+        if not running or track is None or not track.video_id:
+            lyrics_box.border_title = "Lyrics"
+            lyrics_box.update("\n[#00e5ff]Start playback to view synced lyrics.[/]")
             return
 
-        cover_box.update(self.art_renderer.placeholder_markup())
+        vid = track.video_id
+        if self._lyrics_loading_id == vid and self._current_lyrics is None:
+            lyrics_box.border_title = "Lyrics \\[LOADING]"
+            lyrics_box.update("\n[#00e5ff]Searching YouTube Music & LRCLIB for lyrics...[/]")
+            return
 
-        def _fetch_bg() -> None:
-            markup = self.art_renderer.fetch_and_render(vid)
+        data = self._current_lyrics
+        if data is None:
+            lyrics_box.border_title = "Lyrics"
+            lyrics_box.update(
+                "\n[bold #ffd43b]No lyrics available for this track.[/]\n"
+                "[#4c6ef5](Press y to toggle retry)[/]"
+            )
+            return
 
-            def _apply() -> None:
-                if self._cover_video_id == vid:
-                    self.query_one("#cover-box", Static).update(markup)
+        try:
+            box_w = int(lyrics_box.content_size.width)
+            box_h = int(lyrics_box.content_size.height)
+        except Exception:
+            box_w, box_h = 44, 14
+        inner_w = max(24, box_w if box_w > 4 else 44)
+        max_rows = max(6, min(14, box_h if box_h > 2 else 14))
+        wrap_w = max(18, inner_w - 3)
 
-            self._safe_ui(_apply)
+        if data.synced and data.lines:
+            lyrics_box.border_title = f"Lyrics \\[SYNCED - {title_escape(data.source)}]"
+            time_pos = float(status.get("time_pos", 0.0) or 0.0)
+            act_idx = active_line_index(data.lines, time_pos)
 
-        self._run_bg(_fetch_bg)
+            visual_rows: list[tuple[int, bool, str]] = []
+            act_first_row = 0
+            for idx, line in enumerate(data.lines):
+                text_body = line.text.strip() or "~"
+                wrapped = textwrap.wrap(text_body, width=wrap_w) or ["~"]
+                if idx == act_idx:
+                    act_first_row = len(visual_rows)
+                for seg_idx, seg in enumerate(wrapped):
+                    visual_rows.append((idx, seg_idx == 0, seg))
+
+            start_row = max(0, act_first_row - max_rows // 2)
+            if start_row + max_rows > len(visual_rows):
+                start_row = max(0, len(visual_rows) - max_rows)
+            window = visual_rows[start_row : start_row + max_rows]
+
+            rendered: list[str] = []
+            for idx, is_first, seg in window:
+                safe_seg = escape(seg)
+                if idx == act_idx:
+                    prefix = "|> " if is_first else "   "
+                    rendered.append(f"[bold #00ff87]{prefix}{safe_seg}[/]")
+                elif abs(idx - act_idx) == 1:
+                    rendered.append(f"[#ffffff]   {safe_seg}[/]")
+                elif idx < act_idx:
+                    rendered.append(f"[#4c6ef5]   {safe_seg}[/]")
+                else:
+                    rendered.append(f"[#00e5ff]   {safe_seg}[/]")
+            lyrics_box.update("\n".join(rendered))
+            return
+
+        lyrics_box.border_title = f"Lyrics \\[PLAIN - {title_escape(data.source)}]"
+        plain_lines: list[str] = []
+        for raw_line in (data.plain_text or "").splitlines():
+            stripped = raw_line.strip()
+            if not stripped:
+                plain_lines.append("")
+            else:
+                plain_lines.extend(textwrap.wrap(stripped, width=wrap_w) or [""])
+
+        if not plain_lines:
+            lyrics_box.update("\n[bold #ffd43b]No lyrics available for this track.[/]")
+            return
+
+        max_offset = max(0, len(plain_lines) - max_rows)
+        self._lyrics_scroll_offset = max(0, min(self._lyrics_scroll_offset, max_offset))
+        view_rows = plain_lines[self._lyrics_scroll_offset : self._lyrics_scroll_offset + max_rows]
+        rendered = [f"[#00e5ff]   {escape(row)}[/]" if row else "" for row in view_rows]
+        if max_offset > 0 and len(rendered) == max_rows:
+            rendered[-1] = (
+                f"[#4c6ef5]   (j/k scroll {self._lyrics_scroll_offset + 1}/{max_offset + 1})[/]"
+            )
+        lyrics_box.update("\n".join(rendered))
+
+    def _update_focus_now_playing(self, status: dict[str, Any]) -> None:
+        focus_now = self.query_one("#focus-now-playing", Static)
+        running = bool(status.get("running"))
+        paused = bool(status.get("paused", False))
+        track: Track | None = status.get("current_track")
+
+        try:
+            box_w = int(focus_now.content_size.width)
+        except Exception:
+            box_w = 50
+        inner_w = max(28, box_w if box_w > 6 else 50)
+        bar_w = max(12, min(46, inner_w - 22))
+        hints = (
+            "[bold #ffd43b]Spc[/] Pause  [bold #ffd43b]n/p[/] Next/Prev  "
+            "[bold #ffd43b]S/w[/] Shuf/Rep  [bold #ffd43b]y[/] Lyrics  "
+            "[bold #ffd43b]z/Esc[/] Full UI"
+        )
+
+        if not running or track is None:
+            state_line = (
+                "[bold #ff4d94]\\[STOPPED][/] [#ffffff]No active playback session.[/]"
+                if not running
+                else "[bold #ffd43b]\\[IDLE][/] [#ffffff]Daemon ready. Press z/Esc to browse.[/]"
+            )
+            focus_now.border_title = "|> Focus Player"
+            focus_now.update(
+                "\n".join(
+                    [
+                        state_line,
+                        "",
+                        "[bold #00e5ff]Minimalist Focus Mode[/]",
+                        f"{_build_progress_markup(0.0, 0.0, width=bar_w)}  [bold #ffffff]00:00 / 00:00[/]",
+                        "",
+                        hints,
+                    ]
+                )
+            )
+            return
+
+        state_tag = "[bold #ffd43b]\\[PAUSED][/]" if paused else "[bold #00ff87]\\[PLAYING][/]"
+        source_tag = (
+            "[bold #00ff87]\\[LOCAL][/]"
+            if track.local_path
+            else "[bold #00e5ff]\\[STREAM][/]"
+        )
+        liked_tag = " [bold #ff4d94]\\[LIKED][/]" if track.is_liked else ""
+        mode_tag = (
+            "[bold #00e5ff]\\[RADIO][/]"
+            if self.radio_autoplay
+            else "[bold #00ff87]\\[COLLECTION][/]"
+        )
+        time_pos = float(status.get("time_pos", 0.0) or 0.0)
+        duration = float(status.get("duration", 0.0) or 0.0)
+        volume = int(round(float(status.get("volume", 100.0) or 100.0)))
+        pos_idx = int(status.get("playlist_pos", -1))
+        total_count = int(status.get("playlist_count", 0) or 0)
+        track_counter = (
+            f"{pos_idx + 1}/{total_count}" if pos_idx >= 0 and total_count > 0 else "-/-"
+        )
+        bar = _build_progress_markup(time_pos, duration, width=bar_w)
+        timing = f"{format_duration(time_pos)} / {format_duration(duration)}"
+        title_safe = escape(_truncate(track.title, inner_w))
+        artist_safe = escape(_truncate(track.artist, max(16, inner_w - 9)))
+        album_safe = escape(_truncate(track.album or "-", max(16, inner_w - 9)))
+        pl_active = self.playlist_store.get_active_name()
+        pl_info = f"  [bold #ff4d94]PL:[/] [#ffffff]{escape(_truncate(pl_active, 16))}[/]" if pl_active else ""
+        shuffle_tag = "  [bold #ffd43b]\\[SHUFFLE][/]" if self.shuffle_on else ""
+        repeat_tag = (
+            f"  [bold #ff4d94]\\[REPEAT: {self.repeat_mode.upper()}][/]"
+            if self.repeat_mode in ("all", "one")
+            else ""
+        )
+
+        focus_now.border_title = "|> Focus Player"
+        focus_now.update(
+            "\n".join(
+                [
+                    f"{state_tag} {source_tag}{liked_tag}",
+                    f"[bold #ffffff]{title_safe}[/]",
+                    f"[bold #00e5ff]Artist:[/] [bold #ffffff]{artist_safe}[/]",
+                    f"[bold #ff4d94]Album:[/]  [#ffffff]{album_safe}[/]",
+                    "",
+                    f"{bar}  [bold #ffffff]{timing}[/]",
+                    f"[bold #ffd43b]Vol: {volume}%[/]  [bold #00e5ff]Track: {track_counter}[/]  {mode_tag}{shuffle_tag}{repeat_tag}{pl_info}",
+                    "",
+                    hints,
+                ]
+            )
+        )
 
     def _update_top_and_now_playing(self, status: dict[str, Any]) -> None:
         running = bool(status.get("running"))
@@ -710,6 +1317,9 @@ class YTMApp(App[None]):
             f"{daemon_badge}  {auth_badge}{cache_badge}"
         )
         self._update_cover_art(track if running else None)
+        self._ensure_lyrics_for_track(track if running else None)
+        self._update_focus_now_playing(status)
+        self._render_lyrics_panel(status)
 
         now_box = self.query_one("#now-playing-box", Static)
         if not running or track is None:
@@ -759,6 +1369,12 @@ class YTMApp(App[None]):
         album_safe = escape(track.album or "-")
         pl_active = self.playlist_store.get_active_name()
         pl_info = f"   [bold #ff4d94]PL:[/] [#ffffff]{escape(pl_active)}[/]" if pl_active else ""
+        shuffle_tag = "  [bold #ffd43b]\\[SHUFFLE][/]" if self.shuffle_on else ""
+        repeat_tag = (
+            f"  [bold #ff4d94]\\[REPEAT: {self.repeat_mode.upper()}][/]"
+            if self.repeat_mode in ("all", "one")
+            else ""
+        )
 
         now_box.border_title = "|> Now Playing"
         now_box.update(
@@ -767,7 +1383,7 @@ class YTMApp(App[None]):
                     f"{state_tag} {source_tag}{liked_tag}  [bold #ffffff]{title_safe}[/]",
                     f"[bold #00e5ff]Artist:[/] [bold #ffffff]{artist_safe}[/]   [bold #ff4d94]Album:[/] [#ffffff]{album_safe}[/]",
                     f"{bar}  [bold #ffffff]{timing}[/]  [bold #ffd43b]Vol: {volume}%[/]",
-                    f"{mode_tag}  [bold #00e5ff]Track: {track_counter}[/]{pl_info}",
+                    f"{mode_tag}{shuffle_tag}{repeat_tag}  [bold #00e5ff]Track: {track_counter}[/]{pl_info}",
                 ]
             )
         )
@@ -799,6 +1415,8 @@ class YTMApp(App[None]):
             if loaded_queue:
                 self.queue_tracks = loaded_queue
             self.radio_autoplay = bool(status.get("radio_autoplay", self.radio_autoplay))
+            self.shuffle_on = bool(status.get("shuffle", False))
+            self.repeat_mode = str(status.get("repeat_mode", "off"))
             pos_idx = int(status.get("playlist_pos", -1))
             total_count = int(status.get("playlist_count", 0) or 0)
             self.active_queue_pos = pos_idx
@@ -814,6 +1432,7 @@ class YTMApp(App[None]):
             current_track: Track | None = status.get("current_track")
             if (
                 self.radio_autoplay
+                and self.repeat_mode == "off"
                 and total_count > 0
                 and pos_idx == total_count - 1
                 and current_track is not None
@@ -825,41 +1444,115 @@ class YTMApp(App[None]):
                 self._run_bg(lambda: self._refill_radio_bg(seed_id))
         else:
             self.active_queue_pos = -1
+            self.shuffle_on = self.player.load_shuffle()
+            self.repeat_mode = self.player.load_repeat_mode()
 
         self._update_top_and_now_playing(status)
         if self.active_view == "settings":
             self._refresh_settings_table()
+        elif self._in_folders_mode():
+            self._refresh_folders_table()
         else:
             self._refresh_table()
 
+    def _current_spectrum_width(self) -> int:
+        box_id = "#focus-spectrum-box" if self.focus_mode else "#visualizer-box"
+        try:
+            vis_box = self.query_one(box_id, Static)
+            w = int(vis_box.content_size.width)
+            if w > 4:
+                return max(12, min(240, w))
+        except Exception:
+            pass
+        return _BAND_COUNT
+
+    def on_resize(self) -> None:
+        if self.is_mounted:
+            self._tick_visualizer()
+            if self.focus_mode:
+                self._update_focus_now_playing(self.last_status)
+                self._render_lyrics_panel(self.last_status)
+
     def _tick_visualizer(self) -> None:
+        if not self.is_mounted:
+            return
+        box_id = "#focus-spectrum-box" if self.focus_mode else "#visualizer-box"
+        try:
+            vis_box = self.query_one(box_id, Static)
+        except Exception:
+            return
+
         status = self.last_status
         running = bool(status.get("running"))
         paused = bool(status.get("paused", False))
         core_idle = bool(status.get("core_idle", True))
         track: Track | None = status.get("current_track")
 
+        band_count = self._current_spectrum_width()
+        row_count = _SPECTRUM_ROWS
+        if self.focus_mode:
+            try:
+                h = int(vis_box.content_size.height)
+                if h >= _SPECTRUM_ROWS:
+                    row_count = min(24, h)
+            except Exception:
+                row_count = _SPECTRUM_ROWS
+
+        if len(self._bands) != band_count:
+            if self._bands:
+                old_len = len(self._bands)
+                self._bands = [
+                    self._bands[min(old_len - 1, int(i * old_len / band_count))]
+                    for i in range(band_count)
+                ]
+            else:
+                self._bands = [0.02] * band_count
+
+        spec_mode = self.settings_store.load().spectrum_mode
         active = running and not paused and not core_idle and track is not None
-        if active and track is not None:
-            self._vis_phase += 0.38
+        use_fft = active and spec_mode == "fft" and not self.is_headless
+        self.spectrum_analyzer.set_active(use_fft)
+        capturing = use_fft and self.spectrum_analyzer.is_capturing()
+
+        if spec_mode == "off":
+            self._bands = [0.02] * band_count
+            vis_title = "Spectrum \\[OFF]"
+        elif capturing:
+            self._bands = self.spectrum_analyzer.get_bands(band_count)
+            vis_title = "Spectrum \\[LIVE FFT]"
+        elif active and track is not None:
+            vis_title = "Spectrum \\[FFT]" if spec_mode == "fft" else "Spectrum \\[SIM]"
+            self._vis_phase += 0.28
             time_pos = float(status.get("time_pos", 0.0) or 0.0)
             seed = sum(ord(ch) for ch in track.video_id) * 0.13
             t = time_pos * 3.1 + self._vis_phase
-            for i in range(_BAND_COUNT):
-                freq = 0.35 + (i / _BAND_COUNT) * 1.4
+            for i in range(band_count):
+                freq = 0.35 + (i / band_count) * 1.4
                 envelope = 0.72 + 0.28 * math.sin(i * 0.27 + seed)
                 wave_a = 0.5 + 0.5 * math.sin(t * freq + i * 0.48 + seed)
                 wave_b = 0.5 + 0.5 * math.cos(t * (freq * 0.63) - i * 0.31)
                 target = max(0.08, min(1.0, (0.58 * wave_a + 0.42 * wave_b) * envelope))
                 self._bands[i] = self._bands[i] * 0.42 + target * 0.58
         else:
-            for i in range(_BAND_COUNT):
+            vis_title = "Spectrum \\[FFT]" if spec_mode == "fft" else "Spectrum \\[SIM]"
+            for i in range(band_count):
                 self._bands[i] = max(0.02, self._bands[i] * 0.70)
 
-        max_units = _SPECTRUM_ROWS * 8
+        max_units = row_count * 8
         rows: list[str] = []
-        for row_idx in range(_SPECTRUM_ROWS - 1, -1, -1):
-            color = _SPECTRUM_COLORS[row_idx]
+        for row_idx in range(row_count - 1, -1, -1):
+            if row_count == _SPECTRUM_ROWS and row_idx in _SPECTRUM_COLORS:
+                color = _SPECTRUM_COLORS[row_idx]
+            else:
+                frac = row_idx / max(1, row_count - 1)
+                if frac >= 0.70:
+                    color = "#ff4d94"
+                elif frac >= 0.45:
+                    color = "#ffd43b"
+                elif frac >= 0.16:
+                    color = "#00ff87"
+                else:
+                    color = "#00e5ff"
             chars: list[str] = []
             for height in self._bands:
                 units = max(1, min(max_units, int(round(height * max_units))))
@@ -867,7 +1560,8 @@ class YTMApp(App[None]):
                 chars.append(_SPECTRUM_CHARS[row_units])
             rows.append(f"[{color}]{''.join(chars)}[/]")
 
-        self.query_one("#visualizer-box", Static).update("\n".join(rows))
+        vis_box.border_title = vis_title
+        vis_box.update("\n".join(rows))
 
     def _apply_local_path(self, video_id: str, local_str: str) -> None:
         for col in (
@@ -889,37 +1583,76 @@ class YTMApp(App[None]):
     def _on_bg_track_cached(self, track: Track, local_str: str) -> None:
         self._safe_ui(self._apply_local_path, track.video_id, local_str)
 
+    def _apply_table_visibility(self) -> DataTable:
+        """Show only the table matching active_view / folder browse mode and return it."""
+        track_table = self.query_one("#track-table", DataTable)
+        settings_table = self.query_one("#settings-table", DataTable)
+        folders_table = self.query_one("#playlist-folders-table", DataTable)
+
+        if self.active_view == "settings":
+            track_table.display = False
+            folders_table.display = False
+            settings_table.display = True
+            return settings_table
+        if self._in_folders_mode():
+            track_table.display = False
+            settings_table.display = False
+            folders_table.display = True
+            return folders_table
+        settings_table.display = False
+        folders_table.display = False
+        track_table.display = True
+        return track_table
+
     def _active_table(self) -> DataTable:
         if self.active_view == "settings":
             return self.query_one("#settings-table", DataTable)
+        if self._in_folders_mode():
+            return self.query_one("#playlist-folders-table", DataTable)
         return self.query_one("#track-table", DataTable)
 
     def _switch_view(self, view: str) -> None:
         if view not in _VIEW_ORDER:
             return
+        if self.focus_mode:
+            self.focus_mode = False
+            self._apply_focus_layout()
         self.active_view = view
-        track_table = self.query_one("#track-table", DataTable)
-        settings_table = self.query_one("#settings-table", DataTable)
+        self._filter_text = ""
+        self._pending_delete_playlist = None
+        if view == "playlists":
+            self._playlist_browse_mode = "folders"
+
+        self._reload_collections()
+        tbl = self._apply_table_visibility()
         if view == "settings":
-            track_table.display = False
-            settings_table.display = True
             self._refresh_settings_table(force=True)
-            settings_table.focus()
+        elif self._in_folders_mode():
+            self._refresh_folders_table(force=True)
         else:
-            settings_table.display = False
-            track_table.display = True
-            self._reload_collections()
             self._refresh_table(force=True)
-            track_table.focus()
+        tbl.focus()
 
     def _selected_track(self) -> tuple[int, Track] | None:
-        tracks = self._current_view_tracks()
-        if not tracks:
+        if self._in_folders_mode():
+            return None
+        visible = self._visible_rows()
+        if not visible:
             return None
         table = self.query_one("#track-table", DataTable)
         row = table.cursor_row
-        if 0 <= row < len(tracks):
-            return row, tracks[row]
+        if 0 <= row < len(visible):
+            return visible[row]
+        return None
+
+    def _selected_folder(self) -> tuple[int, dict[str, Any]] | None:
+        visible = self._visible_folders()
+        if not visible:
+            return None
+        table = self.query_one("#playlist-folders-table", DataTable)
+        row = table.cursor_row
+        if 0 <= row < len(visible):
+            return visible[row]
         return None
 
     def _run_bg(self, fn) -> None:
@@ -960,6 +1693,8 @@ class YTMApp(App[None]):
             self._refilling_for_video_id = None
             self._reload_collections()
             self.active_view = "queue"
+            self._filter_text = ""
+            self._apply_table_visibility()
             self._refresh_status_tick()
             self._refresh_table(force=True)
             self._set_status(
@@ -990,6 +1725,8 @@ class YTMApp(App[None]):
             self._reload_collections()
             if not stay_in_view:
                 self.active_view = "queue"
+                self._filter_text = ""
+                self._apply_table_visibility()
             self._refresh_status_tick()
             self._refresh_table(force=True)
             self._set_status(
@@ -1010,8 +1747,10 @@ class YTMApp(App[None]):
             self.last_query = query
             self.search_tracks = results
             self.active_view = "search"
+            self._filter_text = ""
+            tbl = self._apply_table_visibility()
             self._refresh_table(force=True)
-            self.query_one("#track-table", DataTable).focus()
+            tbl.focus()
             self._set_status(
                 f"[bold #00ff87]Found {len(results)} tracks[/] for [bold #ffffff]{escape(query)}[/]. "
                 "Press [bold #ffd43b]Enter[/] to play."
@@ -1019,29 +1758,122 @@ class YTMApp(App[None]):
 
         self._safe_ui(_done)
 
+    def _move_folder_cursor_to(self, name: str) -> None:
+        """Move #playlist-folders-table cursor to the visible folder matching name."""
+        visible = self._visible_folders()
+        table = self.query_one("#playlist-folders-table", DataTable)
+        for row_idx, (_, item) in enumerate(visible):
+            if item["name"] == name:
+                table.move_cursor(row=row_idx)
+                return
+
     def _reset_input_to_search(self) -> None:
         self._input_mode = "search"
+        self._rename_target = None
         inp = self.query_one("#search-input", Input)
         inp.placeholder = _SEARCH_PLACEHOLDER
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "search-input" or self._input_mode != "filter":
+            return
+        if event.value == self._filter_text:
+            return
+        self._filter_text = event.value
+        tbl = self._active_table()
+        if self._in_folders_mode():
+            self._refresh_folders_table(force=True)
+        else:
+            self._refresh_table(force=True)
+        if tbl.row_count > 0:
+            tbl.move_cursor(row=0)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "search-input":
             return
         val = event.value.strip()
-        if self._input_mode == "playlist_create":
-            event.input.value = ""
+        mode = self._input_mode
+
+        if mode == "filter":
+            self._filter_text = val
             self._reset_input_to_search()
-            self.query_one("#track-table", DataTable).focus()
+            event.input.value = ""
+            tbl = self._apply_table_visibility()
+            if self._in_folders_mode():
+                self._refresh_folders_table(force=True)
+                total = len(self.playlist_summaries)
+                shown = len(self._visible_folders())
+            else:
+                self._refresh_table(force=True)
+                total = len(self._current_view_tracks())
+                shown = len(self._visible_rows())
+            tbl.focus()
+            if val:
+                self._set_status(
+                    f"[#00e5ff]Filter locked:[/] '[bold #ffffff]{escape(val)}[/]' ({shown}/{total}, Esc to clear)."
+                )
+            else:
+                self._set_status("[#00e5ff]Offline filter cleared.[/]")
+            return
+
+        if mode == "playlist_rename":
+            target = self._rename_target
+            self._reset_input_to_search()
+            event.input.value = ""
+            folders_tbl = self._apply_table_visibility()
+            folders_tbl.focus()
+            if not val or not target:
+                self._set_status("[bold #ffd43b]\\[PLAYLIST][/] Rename cancelled.")
+                return
+            try:
+                renamed = self.playlist_store.rename(target, val)
+            except ValueError as exc:
+                self._set_status(f"[bold #ff4d94]Rename error:[/] {escape(str(exc))}")
+                return
+            self._reload_collections()
+            self._refresh_folders_table(force=True)
+            self._move_folder_cursor_to(renamed)
+            self._set_status(
+                f"[bold #00ff87]\\[PLAYLIST][/] Renamed '[bold #ffffff]{escape(target)}[/]' to '[bold #ffffff]{escape(renamed)}[/]'."
+            )
+            return
+
+        if mode == "playlist_create":
+            self._reset_input_to_search()
+            event.input.value = ""
+            pending = self._pending_add_track
+            self._pending_add_track = None
             if not val:
+                self._active_table().focus()
                 self._set_status("[bold #ffd43b]\\[PLAYLIST][/] Cancelled.")
                 return
             created = self.playlist_store.create(val)
+            if pending is not None:
+                _, added = self.playlist_store.add_track(pending, name=created)
+                self._reload_collections()
+                tbl = self._apply_table_visibility()
+                if self._in_folders_mode():
+                    self._refresh_folders_table(force=True)
+                else:
+                    self._refresh_table(force=True)
+                tbl.focus()
+                verb = "Created playlist and added" if added else "Created playlist for"
+                self._set_status(
+                    f"[bold #00ff87]\\[PLAYLIST][/] {verb} [bold #ffffff]{escape(pending.title)}[/] "
+                    f"in '[bold #ffffff]{escape(created)}[/]'."
+                )
+                return
+
             self.active_view = "playlists"
+            self._playlist_browse_mode = "folders"
+            self._filter_text = ""
             self._reload_collections()
-            self._refresh_table(force=True)
+            folders_tbl = self._apply_table_visibility()
+            self._refresh_folders_table(force=True)
+            self._move_folder_cursor_to(created)
+            folders_tbl.focus()
             self._set_status(
                 f"[bold #00ff87]\\[PLAYLIST][/] Created '[bold #ffffff]{escape(created)}[/]' - "
-                "press [bold #ffd43b]m[/] on any song to add tracks."
+                "press [bold #ffd43b]Enter[/] to open or [bold #ffd43b]m[/] on any song to add tracks."
             )
             return
 
@@ -1054,23 +1886,157 @@ class YTMApp(App[None]):
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id == "settings-table":
             self.action_activate_setting()
+        elif event.data_table.id == "playlist-folders-table":
+            self.action_open_selected_playlist()
         elif event.data_table.id == "track-table":
             self.action_play_selected()
 
     def action_focus_search(self) -> None:
+        if self.focus_mode:
+            self.focus_mode = False
+            self._apply_focus_layout()
         self._input_mode = "search"
         inp = self.query_one("#search-input", Input)
         inp.placeholder = "Search YouTube Music (Enter to search, Esc to cancel)..."
         inp.focus()
 
+    def action_focus_filter(self) -> None:
+        if self.focus_mode:
+            self.focus_mode = False
+            self._apply_focus_layout()
+        if self.active_view == "settings":
+            self._set_status(
+                "[bold #ffd43b]Offline filter is available in track and playlist views \\[1]-\\[5].[/]"
+            )
+            return
+        self._input_mode = "filter"
+        inp = self.query_one("#search-input", Input)
+        inp.placeholder = "Filter current view offline (live, Enter keep, Esc clear)..."
+        inp.value = self._filter_text
+        inp.focus()
+
     def action_create_playlist(self) -> None:
+        if self.focus_mode:
+            self.focus_mode = False
+            self._apply_focus_layout()
         self._input_mode = "playlist_create"
         inp = self.query_one("#search-input", Input)
         inp.value = ""
         inp.placeholder = "New Playlist Name (Enter to create, Esc to cancel)..."
         inp.focus()
 
+    def action_rename_playlist(self) -> None:
+        if not self._in_folders_mode():
+            self._set_status("[bold #ffd43b]Open \\[5] Playlists folder list and press e to rename.[/]")
+            return
+        selection = self._selected_folder()
+        if selection is None:
+            self._set_status("[bold #ffd43b]No playlist folder selected to rename.[/]")
+            return
+        old_name = str(selection[1]["name"])
+        self._rename_target = old_name
+        self._input_mode = "playlist_rename"
+        inp = self.query_one("#search-input", Input)
+        inp.placeholder = f"Rename playlist '{old_name}' (Enter save, Esc cancel)..."
+        inp.value = old_name
+        inp.focus()
+
+    def action_open_selected_playlist(self) -> None:
+        selection = self._selected_folder()
+        if selection is None:
+            self._set_status("[bold #ffd43b]No playlist folder selected. Press c to create one.[/]")
+            return
+        name = str(selection[1]["name"])
+        self.playlist_store.set_active_name(name)
+        self._playlist_browse_mode = "tracks"
+        self._filter_text = ""
+        self._pending_delete_playlist = None
+        self._reload_collections()
+        tbl = self._apply_table_visibility()
+        self._refresh_table(force=True)
+        tbl.focus()
+        self._set_status(
+            f"[bold #ff4d94]\\[PLAYLIST][/] Opened '[bold #ffffff]{escape(name)}[/]' "
+            f"({len(self.playlist_tracks)} tracks, [bold #ffd43b]Esc[/]/[bold #ffd43b]h[/] back to folders)."
+        )
+
+    def action_go_back(self) -> None:
+        if self.active_view == "playlists" and self._playlist_browse_mode == "tracks":
+            active_name = self.playlist_store.get_active_name()
+            self._playlist_browse_mode = "folders"
+            self._filter_text = ""
+            self._pending_delete_playlist = None
+            self._reload_collections()
+            tbl = self._apply_table_visibility()
+            self._refresh_folders_table(force=True)
+            if active_name:
+                self._move_folder_cursor_to(active_name)
+            tbl.focus()
+            self._set_status("[#00e5ff]Showing playlist folders (Enter to open, c new, e rename).[/]")
+
+    def _sync_focus_widgets_after_refresh(self) -> None:
+        self._tick_visualizer()
+        if self.focus_mode:
+            self._update_focus_now_playing(self.last_status)
+            self._render_lyrics_panel(self.last_status)
+
+    def action_toggle_focus_mode(self) -> None:
+        self.focus_mode = not self.focus_mode
+        self._apply_focus_layout()
+        self._refresh_status_tick()
+        self.call_after_refresh(self._sync_focus_widgets_after_refresh)
+
+    def action_toggle_lyrics(self) -> None:
+        if not self.focus_mode:
+            self.focus_mode = True
+            self.lyrics_visible = True
+        else:
+            self.lyrics_visible = not self.lyrics_visible
+        current: Track | None = self.last_status.get("current_track")
+        running = bool(self.last_status.get("running"))
+        if self.lyrics_visible and running and current is not None and current.video_id:
+            self._lyrics_missing_ids.discard(current.video_id)
+        self._apply_focus_layout()
+        if self.lyrics_visible:
+            self._ensure_lyrics_for_track(current if running else None)
+        self._refresh_status_tick()
+        self.call_after_refresh(self._sync_focus_widgets_after_refresh)
+
     def action_focus_table(self) -> None:
+        if isinstance(self.focused, Input):
+            was_filter = self._input_mode == "filter"
+            self._reset_input_to_search()
+            inp = self.query_one("#search-input", Input)
+            inp.value = ""
+            self._pending_add_track = None
+            if was_filter:
+                self._filter_text = ""
+                if self._in_folders_mode():
+                    self._refresh_folders_table(force=True)
+                else:
+                    self._refresh_table(force=True)
+            self._active_table().focus()
+            return
+        if self.focus_mode:
+            if self.lyrics_visible:
+                self.lyrics_visible = False
+            else:
+                self.focus_mode = False
+            self._apply_focus_layout()
+            self._refresh_status_tick()
+            self.call_after_refresh(self._sync_focus_widgets_after_refresh)
+            return
+        if self._filter_active():
+            self._filter_text = ""
+            if self._in_folders_mode():
+                self._refresh_folders_table(force=True)
+            else:
+                self._refresh_table(force=True)
+            self._set_status("[#00e5ff]Cleared offline filter.[/]")
+            return
+        if self.active_view == "playlists" and self._playlist_browse_mode == "tracks":
+            self.action_go_back()
+            return
         self._reset_input_to_search()
         self._active_table().focus()
 
@@ -1097,17 +2063,53 @@ class YTMApp(App[None]):
         self._switch_view(_VIEW_ORDER[(idx + 1) % len(_VIEW_ORDER)])
 
     def action_cursor_down(self) -> None:
+        if self.focus_mode:
+            if (
+                self.lyrics_visible
+                and self._current_lyrics is not None
+                and not self._current_lyrics.synced
+            ):
+                self._lyrics_scroll_offset += 1
+                self._render_lyrics_panel(self.last_status)
+            return
         self._active_table().action_cursor_down()
 
     def action_cursor_up(self) -> None:
+        if self.focus_mode:
+            if (
+                self.lyrics_visible
+                and self._current_lyrics is not None
+                and not self._current_lyrics.synced
+            ):
+                self._lyrics_scroll_offset = max(0, self._lyrics_scroll_offset - 1)
+                self._render_lyrics_panel(self.last_status)
+            return
         self._active_table().action_cursor_up()
 
     def action_cursor_top(self) -> None:
+        if self.focus_mode:
+            if (
+                self.lyrics_visible
+                and self._current_lyrics is not None
+                and not self._current_lyrics.synced
+            ):
+                self._lyrics_scroll_offset = 0
+                self._render_lyrics_panel(self.last_status)
+            return
         table = self._active_table()
         if table.row_count > 0:
             table.move_cursor(row=0)
 
     def action_cursor_bottom(self) -> None:
+        if self.focus_mode:
+            if (
+                self.lyrics_visible
+                and self._current_lyrics is not None
+                and not self._current_lyrics.synced
+            ):
+                self._lyrics_scroll_offset += 10000
+                self._render_lyrics_panel(self.last_status)
+            return
         table = self._active_table()
         if table.row_count > 0:
             table.move_cursor(row=table.row_count - 1)
@@ -1125,11 +2127,35 @@ class YTMApp(App[None]):
             "preload_limit",
             "audio_quality",
             "stream_buffer_secs",
+            "mpris_enabled",
+            "spectrum_mode",
         ):
             updated = self.settings_store.cycle(key)
             self.cache_manager.wake()
             self._refresh_settings_table(force=True)
-            if key in ("audio_quality", "stream_buffer_secs"):
+            if key == "mpris_enabled":
+                if updated.mpris_enabled:
+                    self._run_bg(self.player._maybe_start_mpris)
+                    self._set_status(
+                        "[bold #00ff87]\\[SETTINGS][/] MPRIS Media Keys = [bold #ffffff]ON[/] "
+                        "(global keyboard and KDE controls active)."
+                    )
+                else:
+                    self._run_bg(self.player._maybe_stop_mpris)
+                    self._set_status(
+                        "[bold #ffd43b]\\[SETTINGS][/] MPRIS Media Keys = [bold #ffffff]OFF[/] "
+                        "(MPRIS bridge stopped)."
+                    )
+            elif key == "spectrum_mode":
+                if updated.spectrum_mode == "fft" and not self.is_headless:
+                    self.spectrum_analyzer.start()
+                else:
+                    self.spectrum_analyzer.stop()
+                self._tick_visualizer()
+                self._set_status(
+                    f"[bold #00ff87]\\[SETTINGS][/] Spectrum Mode = [bold #ffffff]{updated.spectrum_mode}[/]."
+                )
+            elif key in ("audio_quality", "stream_buffer_secs"):
                 val_label = (
                     f"{updated.stream_buffer_secs}s"
                     if key == "stream_buffer_secs"
@@ -1182,6 +2208,9 @@ class YTMApp(App[None]):
         if self.active_view == "settings":
             self.action_activate_setting()
             return
+        if self._in_folders_mode():
+            self.action_open_selected_playlist()
+            return
         selection = self._selected_track()
         if selection is None:
             self._set_status("[bold #ffd43b]No track selected.[/]")
@@ -1217,6 +2246,49 @@ class YTMApp(App[None]):
             self._run_bg(lambda: self._play_track_with_radio_bg(track))
 
     def action_play_view_queue(self) -> None:
+        if self._in_folders_mode():
+            selection = self._selected_folder()
+            if selection is None:
+                self._set_status("[bold #ffd43b]No playlist folder selected.[/]")
+                return
+            name = str(selection[1]["name"])
+            self.playlist_store.set_active_name(name)
+            tracks = self.liked_store.annotate(self.playlist_store.get_tracks(name))
+            if not tracks:
+                self._set_status(
+                    f"[bold #ffd43b]Playlist '[bold #ffffff]{escape(name)}[/]' has no tracks.[/]"
+                )
+                return
+            self.radio_autoplay = False
+            self._set_status(
+                f"[#00e5ff]Playing playlist[/] [bold #ffffff]{escape(name)}[/] ({len(tracks)} tracks)..."
+            )
+            self._run_bg(
+                lambda: self._play_queue_bg(
+                    tracks, 0, stay_in_view=True, radio_autoplay=False
+                )
+            )
+            return
+
+        if self._filter_active():
+            visible = self._visible_rows()
+            if not visible:
+                self._set_status("[bold #ffd43b]Filtered view has no matching tracks.[/]")
+                return
+            filtered_tracks = [t for _, t in visible]
+            cursor_row = self.query_one("#track-table", DataTable).cursor_row
+            start_idx = max(0, min(cursor_row, len(filtered_tracks) - 1))
+            self.radio_autoplay = False
+            self._set_status(
+                f"[#00e5ff]Playing {len(filtered_tracks)} filtered tracks...[/]"
+            )
+            self._run_bg(
+                lambda: self._play_queue_bg(
+                    filtered_tracks, start_idx, stay_in_view=True, radio_autoplay=False
+                )
+            )
+            return
+
         tracks = self._current_view_tracks()
         if not tracks:
             self._set_status("[bold #ffd43b]Current view has no tracks to play.[/]")
@@ -1230,6 +2302,38 @@ class YTMApp(App[None]):
                 list(tracks), start_idx, stay_in_view=True, radio_autoplay=False
             )
         )
+
+    def action_toggle_shuffle(self) -> None:
+        try:
+            enabled = self.player.toggle_shuffle()
+        except MPVError as exc:
+            self._set_status(f"[bold #ff4d94]{escape(str(exc))}[/]")
+            return
+        self.shuffle_on = enabled
+        self._reload_collections()
+        self._refresh_status_tick()
+        if self._in_folders_mode():
+            self._refresh_folders_table(force=True)
+        else:
+            self._refresh_table(force=True)
+        if enabled:
+            self._set_status(
+                "[bold #ffd43b]\\[SHUFFLE: ON][/] Upcoming tracks shuffled smoothly."
+            )
+        else:
+            self._set_status(
+                "[bold #00e5ff]\\[SHUFFLE: OFF][/] Restored original queue order."
+            )
+
+    def action_cycle_repeat(self) -> None:
+        try:
+            mode = self.player.cycle_repeat()
+        except (MPVError, ValueError) as exc:
+            self._set_status(f"[bold #ff4d94]{escape(str(exc))}[/]")
+            return
+        self.repeat_mode = mode
+        self._refresh_status_tick()
+        self._set_status(f"[bold #ff4d94]\\[REPEAT: {mode.upper()}][/]")
 
     def action_start_radio(self) -> None:
         selection = self._selected_track()
@@ -1338,6 +2442,32 @@ class YTMApp(App[None]):
             return
         self._last_remove_ts = now
 
+        if self._in_folders_mode():
+            selection = self._selected_folder()
+            if selection is None:
+                self._set_status("[bold #ffd43b]No playlist folder selected to delete.[/]")
+                return
+            name = str(selection[1]["name"])
+            if (
+                self._pending_delete_playlist is not None
+                and self._pending_delete_playlist[0] == name
+                and (now - self._pending_delete_playlist[1]) <= 3.5
+            ):
+                self.playlist_store.delete(name)
+                self._pending_delete_playlist = None
+                self._reload_collections()
+                self._refresh_folders_table(force=True)
+                self._set_status(
+                    f"[bold #ffd43b]\\[DELETED][/] Deleted playlist '[bold #ffffff]{escape(name)}[/]'."
+                )
+            else:
+                self._pending_delete_playlist = (name, now)
+                self._set_status(
+                    f"[bold #ff4d94]\\[CONFIRM][/] Press [bold #ffd43b]x[/] again within 3s to delete playlist "
+                    f"'[bold #ffffff]{escape(name)}[/]'."
+                )
+            return
+
         selection = self._selected_track()
         if selection is None:
             self._set_status("[bold #ffd43b]No track selected to remove.[/]")
@@ -1389,10 +2519,32 @@ class YTMApp(App[None]):
             f"[bold #00ff87]\\[UNDO][/] Restored [bold #ffffff]{escape(restored.title)}[/] to Liked Music!"
         )
 
-    def _add_to_playlist(self, track: Track) -> None:
-        pl_name, added = self.playlist_store.add_track(track)
+    def _add_to_playlist(self, track: Track, playlist_name: str | None = None) -> None:
+        if playlist_name is None:
+            names = self.playlist_store.list_names()
+            if len(names) >= 2:
+                def _on_picked(choice: str | None) -> None:
+                    if choice is None:
+                        self._set_status("[bold #ffd43b]\\[PLAYLIST][/] Add cancelled.")
+                        return
+                    if choice == _NEW_PLAYLIST_SENTINEL:
+                        self._pending_add_track = track
+                        self.action_create_playlist()
+                        return
+                    self._add_to_playlist(track, playlist_name=choice)
+
+                self.push_screen(
+                    PlaylistPickerModal(names, self.playlist_store.get_active_name(), track.title),
+                    _on_picked,
+                )
+                return
+
+        pl_name, added = self.playlist_store.add_track(track, name=playlist_name)
         self._reload_collections()
-        self._refresh_table(force=True)
+        if self._in_folders_mode():
+            self._refresh_folders_table(force=True)
+        else:
+            self._refresh_table(force=True)
         if added:
             self._set_status(
                 f"[bold #00ff87]\\[PLAYLIST][/] Added [bold #ffffff]{escape(track.title)}[/] "
@@ -1426,8 +2578,13 @@ class YTMApp(App[None]):
             )
             return
         self.active_view = "playlists"
+        self._playlist_browse_mode = "tracks"
+        self._filter_text = ""
+        self._pending_delete_playlist = None
         self._reload_collections()
+        tbl = self._apply_table_visibility()
         self._refresh_table(force=True)
+        tbl.focus()
         self._set_status(
             f"[bold #ff4d94]\\[PLAYLIST][/] Active playlist: [bold #ffffff]{escape(new_name)}[/] "
             f"({len(self.playlist_tracks)} tracks)"
@@ -1550,15 +2707,17 @@ class YTMApp(App[None]):
         self._set_status(f"[bold #ffd43b]Volume: {int(round(vol))}%[/]")
 
     def action_detach_quit(self) -> None:
+        self.spectrum_analyzer.stop()
         self.cache_manager.stop()
         self.exit()
 
     def action_stop_quit(self) -> None:
+        self.spectrum_analyzer.stop()
         self.cache_manager.stop()
         self.player.stop()
         self.exit()
 
 
-def run_tui() -> None:
+def run_tui(focus: bool = False) -> None:
     """Launch the interactive Textual TUI."""
-    YTMApp().run()
+    YTMApp(initial_focus=focus).run()

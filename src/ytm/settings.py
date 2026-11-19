@@ -13,6 +13,7 @@ from ytm.config import SETTINGS_FILE, ensure_dirs
 PRELOAD_LIMIT_CHOICES = (5, 10, 20)
 AUDIO_QUALITY_CHOICES = ("best", "saver")
 STREAM_BUFFER_CHOICES = (60, 300, 600)
+SPECTRUM_MODE_CHOICES = ("fft", "simulated", "off")
 
 _CYCLE_MAP: dict[str, tuple[Any, ...]] = {
     "auto_cache_liked": (False, True),
@@ -20,6 +21,8 @@ _CYCLE_MAP: dict[str, tuple[Any, ...]] = {
     "preload_limit": PRELOAD_LIMIT_CHOICES,
     "audio_quality": AUDIO_QUALITY_CHOICES,
     "stream_buffer_secs": STREAM_BUFFER_CHOICES,
+    "mpris_enabled": (False, True),
+    "spectrum_mode": SPECTRUM_MODE_CHOICES,
 }
 
 
@@ -32,6 +35,8 @@ class AppSettings:
     preload_limit: int = 10
     audio_quality: str = "best"
     stream_buffer_secs: int = 600
+    mpris_enabled: bool = True
+    spectrum_mode: str = "fft"
 
     @property
     def ytdlp_format(self) -> str:
@@ -71,12 +76,20 @@ class AppSettings:
             buf_int = defaults.stream_buffer_secs
         stream_buffer_secs = buf_int if buf_int in STREAM_BUFFER_CHOICES else defaults.stream_buffer_secs
 
+        raw_mpris = data.get("mpris_enabled", defaults.mpris_enabled)
+        mpris_enabled = bool(raw_mpris) if isinstance(raw_mpris, bool) else defaults.mpris_enabled
+
+        raw_spec = str(data.get("spectrum_mode", defaults.spectrum_mode)).lower()
+        spectrum_mode = raw_spec if raw_spec in SPECTRUM_MODE_CHOICES else defaults.spectrum_mode
+
         return cls(
             auto_cache_liked=auto_cache_liked,
             preload_next=preload_next,
             preload_limit=preload_limit,
             audio_quality=audio_quality,
             stream_buffer_secs=stream_buffer_secs,
+            mpris_enabled=mpris_enabled,
+            spectrum_mode=spectrum_mode,
         )
 
 

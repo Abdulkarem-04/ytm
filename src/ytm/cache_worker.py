@@ -146,7 +146,9 @@ class BackgroundCacheManager:
                 max_files=settings.preload_limit,
                 audio_format=settings.ytdlp_format,
             )
-            self.player.replace_upcoming_entry(queue_index, str(saved_path))
+            self.player.replace_upcoming_entry(
+                queue_index, str(saved_path), expected_video_id=track.video_id
+            )
         except Exception as exc:
             with self._lock:
                 self._last_error = clean_error_text(exc)
@@ -176,7 +178,7 @@ class BackgroundCacheManager:
         queue: list[Track] = status.get("queue") or []
         for idx, item in enumerate(queue):
             if idx > active_pos and item.video_id == video_id:
-                self.player.replace_upcoming_entry(idx, local_str)
+                self.player.replace_upcoming_entry(idx, local_str, expected_video_id=video_id)
 
     def _run_one_liked_cache(self, track: Track) -> None:
         settings = self.settings_store.load()

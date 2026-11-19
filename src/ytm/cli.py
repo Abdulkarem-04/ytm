@@ -85,6 +85,13 @@ def _render_now_playing(status: dict[str, Any]) -> None:
         if track.local_path
         else " [bright_cyan]\\[STREAM][/bright_cyan]"
     )
+    shuffle_tag = " [bold bright_yellow]\\[SHUFFLE][/bold bright_yellow]" if status.get("shuffle") else ""
+    repeat_mode = str(status.get("repeat_mode", "off"))
+    repeat_tag = (
+        f" [bold bright_magenta]\\[REPEAT: {repeat_mode.upper()}][/bold bright_magenta]"
+        if repeat_mode in ("all", "one")
+        else ""
+    )
 
     bar = _build_progress_bar(time_pos, duration)
     timing = f"{format_duration(time_pos)} / {format_duration(duration)}"
@@ -95,7 +102,7 @@ def _render_now_playing(status: dict[str, Any]) -> None:
     )
 
     body = (
-        f"{state_tag}{liked_tag}{source_tag}  "
+        f"{state_tag}{liked_tag}{source_tag}{shuffle_tag}{repeat_tag}  "
         f"[bold bright_white]{escape(track.title)}[/bold bright_white]\n"
         f"[bright_cyan]Artist:[/bright_cyan] [bold bright_cyan]{escape(track.artist)}[/bold bright_cyan]\n"
         f"{album_line}"
@@ -315,6 +322,33 @@ def _cmd_replay(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_shuffle(args: argparse.Namespace) -> int:
+    player = MPVPlayer()
+    mode = getattr(args, "mode", "toggle")
+    if mode == "on":
+        enabled = player.set_shuffle(True)
+    elif mode == "off":
+        enabled = player.set_shuffle(False)
+    else:
+        enabled = player.toggle_shuffle()
+    if enabled:
+        console.print("[bold bright_yellow]\\[SHUFFLE: ON][/bold bright_yellow] Upcoming tracks shuffled.")
+    else:
+        console.print("[bold bright_cyan]\\[SHUFFLE: OFF][/bold bright_cyan] Original queue order restored.")
+    return 0
+
+
+def _cmd_repeat(args: argparse.Namespace) -> int:
+    player = MPVPlayer()
+    mode = getattr(args, "mode", "cycle")
+    if mode == "cycle":
+        resolved = player.cycle_repeat()
+    else:
+        resolved = player.set_repeat_mode(mode)
+    console.print(f"[bold bright_magenta]\\[REPEAT: {resolved.upper()}][/bold bright_magenta]")
+    return 0
+
+
 def _cmd_queue(_args: argparse.Namespace) -> int:
     player = MPVPlayer()
     status = player.get_status()
@@ -346,8 +380,8 @@ def _cmd_stop(_args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_tui(_args: argparse.Namespace) -> int:
-    run_tui()
+def _cmd_tui(args: argparse.Namespace) -> int:
+    run_tui(focus=bool(getattr(args, "focus", False)))
     return 0
 
 
@@ -546,6 +580,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="version",
         version=f"ytm {__version__}",
     )
+    parser.add_argument(
+        "--focus",
+        action="store_true",
+        help="Launch directly into minimalist Focus Mode",
+    )
 
     sub = parser.add_subparsers(dest="command")
 
@@ -588,6 +627,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_replay = sub.add_parser("replay", help="Restart the current track from 00:00")
     p_replay.set_defaults(func=_cmd_replay)
 
+    p_shuffle = sub.add_parser("shuffle", help="Toggle or set shuffle mode")
+    p_shuffle.add_argument(
+        "mode",
+        nargs="?",
+        choices=["on", "off", "toggle"],
+        default="toggle",
+        help="Shuffle state (default: toggle)",
+    )
+    p_shuffle.set_defaults(func=_cmd_shuffle)
+
+    p_repeat = sub.add_parser("repeat", help="Cycle or set repeat mode (off, all, one)")
+    p_repeat.add_argument(
+        "mode",
+        nargs="?",
+        choices=["off", "all", "one", "cycle"],
+        default="cycle",
+        help="Repeat mode (default: cycle)",
+    )
+    p_repeat.set_defaults(func=_cmd_repeat)
+
     p_queue = sub.add_parser("queue", help="Display the full playback queue")
     p_queue.set_defaults(func=_cmd_queue)
 
@@ -599,6 +658,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_stop.set_defaults(func=_cmd_stop)
 
     p_tui = sub.add_parser("tui", help="Launch the interactive multi-pane terminal UI")
+    p_tui.add_argument(
+        "--focus",
+        action="store_true",
+        help="Launch directly into minimalist Focus Mode",
+    )
     p_tui.set_defaults(func=_cmd_tui)
 
     p_like = sub.add_parser("like", help="Toggle like on the currently playing track")
@@ -640,7 +704,7 @@ def main(argv: list[str] | None = None) -> int:
     handler = getattr(args, "func", None)
     if handler is None:
         if sys.stdout.isatty() and sys.stdin.isatty():
-            run_tui()
+            run_tui(focus=bool(getattr(args, "focus", False)))
             return 0
         return _cmd_status(args)
     try:

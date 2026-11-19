@@ -105,6 +105,49 @@ class PlaylistStore:
             self._save(data)
             return True
 
+    def rename(self, old_name: str, new_name: str) -> str:
+        """Rename a playlist in place (preserving order) and return the new name."""
+        clean = new_name.strip()
+        if not clean:
+            raise ValueError("Playlist name cannot be empty.")
+        with self._lock:
+            data = self._load()
+            if old_name not in data["playlists"]:
+                raise ValueError(f"Playlist '{old_name}' does not exist.")
+            if clean == old_name:
+                return clean
+            if clean in data["playlists"]:
+                raise ValueError(f"A playlist named '{clean}' already exists.")
+            data["playlists"] = {
+                (clean if name == old_name else name): items
+                for name, items in data["playlists"].items()
+            }
+            if data["active"] == old_name:
+                data["active"] = clean
+            self._save(data)
+            return clean
+
+    def list_summaries(self) -> list[dict[str, Any]]:
+        """Return name, track count, locally cached count, and active flag per playlist."""
+        with self._lock:
+            data = self._load()
+        summaries: list[dict[str, Any]] = []
+        for name, items in data["playlists"].items():
+            local = sum(
+                1
+                for it in items
+                if isinstance(it.get("local_path"), str) and Path(it["local_path"]).is_file()
+            )
+            summaries.append(
+                {
+                    "name": name,
+                    "count": len(items),
+                    "local": local,
+                    "active": name == data["active"],
+                }
+            )
+        return summaries
+
     def get_tracks(self, name: str | None = None) -> list[Track]:
         """Return tracks belonging to the given playlist (or active playlist)."""
         with self._lock:

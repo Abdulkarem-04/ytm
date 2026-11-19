@@ -13,6 +13,9 @@ dependencies = [
     "yt-dlp>=2024.1.0",
     "textual>=0.80.0",
     "rich>=13.7.0",
+    "dbus-fast>=2.0.0",
+    "pillow>=10.0.0",
+    "numpy>=2.0.0",
 ]
 
 [project.optional-dependencies]

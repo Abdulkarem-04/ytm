@@ -51,6 +51,8 @@ def test_settings_store_defaults_cycling_and_persistence(tmp_path: Path) -> None
     assert defaults.preload_limit == 10
     assert defaults.audio_quality == "best"
     assert defaults.stream_buffer_secs == 600
+    assert defaults.mpris_enabled is True
+    assert defaults.spectrum_mode == "fft"
     assert defaults.ytdlp_format == "bestaudio/best"
 
     s1 = store.cycle("auto_cache_liked")
@@ -65,6 +67,9 @@ def test_settings_store_defaults_cycling_and_persistence(tmp_path: Path) -> None
     assert s4.ytdlp_format == "bestaudio[abr<=96]/bestaudio/best"
     s5 = store.cycle("stream_buffer_secs")
     assert s5.stream_buffer_secs == 60
+    s6 = store.cycle("mpris_enabled")
+    assert s6.mpris_enabled is False
+    assert store.cycle("spectrum_mode").spectrum_mode == "simulated"
 
     reloaded = SettingsStore(settings_file=cfg_path).load()
     assert reloaded.auto_cache_liked is True
@@ -72,11 +77,21 @@ def test_settings_store_defaults_cycling_and_persistence(tmp_path: Path) -> None
     assert reloaded.preload_limit == 5
     assert reloaded.audio_quality == "saver"
     assert reloaded.stream_buffer_secs == 60
+    assert reloaded.mpris_enabled is False
+    assert reloaded.spectrum_mode == "simulated"
 
-    clamped = AppSettings.from_dict({"preload_limit": 999, "audio_quality": "invalid", "stream_buffer_secs": -1})
+    clamped = AppSettings.from_dict(
+        {
+            "preload_limit": 999,
+            "audio_quality": "invalid",
+            "stream_buffer_secs": -1,
+            "spectrum_mode": "invalid",
+        }
+    )
     assert clamped.preload_limit == 10
     assert clamped.audio_quality == "best"
     assert clamped.stream_buffer_secs == 600
+    assert clamped.spectrum_mode == "fft"
 
 
 def test_downloader_preload_prune_clear_and_promote(tmp_path: Path, monkeypatch: Any) -> None:
@@ -322,7 +337,7 @@ def test_tui_settings_page_toggles_and_actions(tmp_path: Path) -> None:
             assert app.active_view == "settings"
             assert settings_table.display is True
             assert track_table.display is False
-            assert settings_table.row_count == 8
+            assert settings_table.row_count == 10
 
             # Row 0: Toggle Auto-Cache Liked Music OFF -> ON -> OFF
             await pilot.press("enter")
@@ -350,8 +365,8 @@ def test_tui_settings_page_toggles_and_actions(tmp_path: Path) -> None:
             await pilot.pause()
             assert settings_store.load().audio_quality == "saver"
 
-            # Row 5: Clear Temp Preload (j past row 4 stream_buffer_secs to row 5)
-            await pilot.press("j", "j", "enter")
+            # Row 7: Clear Temp Preload (j past stream_buffer_secs, mpris_enabled, spectrum_mode)
+            await pilot.press("j", "j", "j", "j", "enter")
             await pilot.pause()
             assert not (preload_dir / "temp_song.opus").exists()
 

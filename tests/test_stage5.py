@@ -218,7 +218,8 @@ def test_tui_safe_like_undo_custom_playlists_and_collection_playback(tmp_path: P
                 await pilot.pause()
                 assert app.active_view == "playlists"
                 assert playlist_store.get_active_name() == "Chill"
-                assert app.focused is table
+                folders_table = app.query_one("#playlist-folders-table", DataTable)
+                assert app.focused is folders_table
 
                 # Switch back to Liked Music, add both tracks with m
                 await pilot.press("3")
@@ -230,10 +231,14 @@ def test_tui_safe_like_undo_custom_playlists_and_collection_playback(tmp_path: P
                 await pilot.press("m")
                 await pilot.pause()
 
-                # Switch to [5] Playlists and play inside playlist view
+                # Switch to [5] Playlists folder list, open Chill, and play inside playlist view
                 await pilot.press("5")
                 await pilot.pause()
                 assert app.active_view == "playlists"
+                assert folders_table.row_count == 1
+                await pilot.press("enter")
+                await pilot.pause()
+                assert table.display is True
                 assert table.row_count == 2
 
                 await pilot.press("enter")

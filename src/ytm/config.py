@@ -18,6 +18,8 @@ STATE_FILE = CACHE_DIR / "state.json"
 STREAM_CACHE_FILE = CACHE_DIR / "stream_cache.json"
 COVERS_DIR = CACHE_DIR / "covers"
 PRELOAD_DIR = CACHE_DIR / "preload"
+LYRICS_DIR = CACHE_DIR / "lyrics"
+MPRIS_PID_FILE = CACHE_DIR / "mpris.pid"
 MPV_SOCKET_PATH = Path("/tmp/ytm-mpv.sock")
 
 _BUNDLED_YTDLP = Path(__file__).resolve().parents[2] / ".venv" / "bin" / "yt-dlp"
@@ -40,6 +42,6 @@ def get_ytdlp_path() -> str:
 
 
 def ensure_dirs() -> None:
-    """Create configuration, cache, cover art, preload, and local music directories if missing."""
-    for directory in (CONFIG_DIR, CACHE_DIR, COVERS_DIR, PRELOAD_DIR, MUSIC_DIR):
+    """Create configuration, cache, cover art, preload, lyrics, and local music directories if missing."""
+    for directory in (CONFIG_DIR, CACHE_DIR, COVERS_DIR, PRELOAD_DIR, LYRICS_DIR, MUSIC_DIR):
         directory.mkdir(parents=True, exist_ok=True)

@@ -10,6 +10,8 @@ import wave
 from pathlib import Path
 from typing import Any
 
+import requests
+
 from ytm.api import YTMClient
 from ytm.cli import build_parser
 from ytm.liked import LikedStore
@@ -73,7 +75,7 @@ def test_ytm_client_search_and_radio(tmp_path: Path, monkeypatch: Any) -> None:
     except OSError:
         online = False
 
-    if not online:
+    def _install_offline_mocks() -> None:
         def _fake_search(query: str, filter: str = "songs", limit: int = 15) -> list[dict[str, Any]]:
             return [
                 {
@@ -109,14 +111,24 @@ def test_ytm_client_search_and_radio(tmp_path: Path, monkeypatch: Any) -> None:
         monkeypatch.setattr(client.yt, "search", _fake_search)
         monkeypatch.setattr(client.yt, "get_watch_playlist", _fake_watch)
 
-    results = client.search_tracks("Daft Punk Veridis Quo", limit=5)
-    assert len(results) >= 1
-    first = results[0]
+    if not online:
+        _install_offline_mocks()
+
+    try:
+        results = client.search_tracks("Daft Punk Veridis Quo", limit=5)
+        assert len(results) >= 1
+        first = results[0]
+        radio = client.get_radio_queue(first.video_id, limit=10)
+    except requests.exceptions.RequestException:
+        _install_offline_mocks()
+        results = client.search_tracks("Daft Punk Veridis Quo", limit=5)
+        assert len(results) >= 1
+        first = results[0]
+        radio = client.get_radio_queue(first.video_id, limit=10)
+
     assert first.video_id
     assert first.title
     assert first.artist
-
-    radio = client.get_radio_queue(first.video_id, limit=10)
     assert len(radio) >= 1
     assert all(t.video_id and t.title for t in radio)
 

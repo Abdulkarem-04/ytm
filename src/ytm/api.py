@@ -133,3 +133,80 @@ class YTMClient:
             return True
         except Exception:
             return False
+
+    def fetch_lyrics(self, video_id: str) -> dict[str, Any] | None:
+        """Fetch timed or plain lyrics for video_id from YouTube Music if available."""
+        if not video_id:
+            return None
+        try:
+            watch = self.yt.get_watch_playlist(videoId=video_id, limit=1)
+        except Exception:
+            return None
+
+        browse_id = watch.get("lyrics") if isinstance(watch, dict) else None
+        if not isinstance(browse_id, str) or not browse_id.strip():
+            return None
+
+        raw: Any = None
+        try:
+            raw = self.yt.get_lyrics(browse_id, timestamps=True)
+        except Exception:
+            raw = None
+        if raw is None:
+            try:
+                raw = self.yt.get_lyrics(browse_id, timestamps=False)
+            except Exception:
+                return None
+
+        if not isinstance(raw, dict):
+            return None
+
+        source = str(raw.get("source") or "YouTube Music")
+        raw_lyrics = raw.get("lyrics")
+
+        if bool(raw.get("hasTimestamps")) and isinstance(raw_lyrics, list):
+            lines: list[dict[str, Any]] = []
+            plain_lines: list[str] = []
+            for item in raw_lyrics:
+                if isinstance(item, dict):
+                    text = str(item.get("text") or "")
+                    start_ms = item.get("start_time")
+                    end_ms = item.get("end_time")
+                else:
+                    text = str(getattr(item, "text", "") or "")
+                    start_ms = getattr(item, "start_time", None)
+                    end_ms = getattr(item, "end_time", None)
+
+                if start_ms is None:
+                    continue
+                try:
+                    start_sec = max(0.0, float(start_ms) / 1000.0)
+                except (TypeError, ValueError):
+                    continue
+                end_sec: float | None = None
+                if end_ms is not None:
+                    try:
+                        end_sec = max(start_sec, float(end_ms) / 1000.0)
+                    except (TypeError, ValueError):
+                        end_sec = None
+
+                lines.append({"start_sec": start_sec, "end_sec": end_sec, "text": text})
+                plain_lines.append(text)
+
+            if lines:
+                return {
+                    "synced": True,
+                    "source": source,
+                    "lines": lines,
+                    "plain_text": "\n".join(plain_lines),
+                }
+
+        if isinstance(raw_lyrics, str) and raw_lyrics.strip():
+            return {
+                "synced": False,
+                "source": source,
+                "lines": [],
+                "plain_text": raw_lyrics.strip(),
+            }
+
+        return None

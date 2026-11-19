@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import random
 import socket
 import subprocess
 import threading
@@ -15,6 +17,8 @@ from ytm.liked import LikedStore
 from ytm.models import Track
 from ytm.resolver import StreamResolver
 from ytm.settings import SettingsStore
+
+REPEAT_MODES = ("off", "all", "one")
 
 
 class MPVError(RuntimeError):
@@ -36,7 +40,8 @@ class MPVPlayer:
         self.liked_store = liked_store or LikedStore()
         self.settings_store = settings_store or SettingsStore()
         self.resolver = StreamResolver()
-        self._playlist_lock = threading.Lock()
+        self._playlist_lock = threading.RLock()
+        self._rng = random.Random()
 
     def _ipc(self, command: list[Any], timeout: float = 2.0) -> dict[str, Any]:
         """Send a single JSON-IPC command to mpv and return its response object."""
@@ -92,9 +97,28 @@ class MPVPlayer:
         except MPVError:
             return False
 
+    def _maybe_start_mpris(self) -> bool:
+        """Launch the detached MPRIS bridge for the live production daemon when enabled."""
+        if self.socket_path != MPV_SOCKET_PATH:
+            return False
+        if not self.settings_store.load().mpris_enabled:
+            return False
+        from ytm.mpris import ensure_mpris_daemon
+
+        return ensure_mpris_daemon(socket_path=self.socket_path, state_file=self.state_file)
+
+    def _maybe_stop_mpris(self) -> bool:
+        """Stop the detached MPRIS bridge for the live production daemon."""
+        if self.socket_path != MPV_SOCKET_PATH:
+            return False
+        from ytm.mpris import stop_mpris_daemon
+
+        return stop_mpris_daemon()
+
     def ensure_daemon(self) -> None:
         """Start the background mpv daemon if it is not already running."""
         if self.is_running():
+            self._maybe_start_mpris()
             return
 
         ensure_dirs()
@@ -139,63 +163,93 @@ class MPVPlayer:
             if proc.poll() is not None:
                 raise MPVError(f"mpv daemon exited prematurely with code {proc.returncode}.")
             if self.is_running():
+                self._maybe_start_mpris()
                 return
             time.sleep(0.05)
 
         raise MPVError("Timed out waiting for mpv IPC socket to become ready.")
 
+    def _load_state(self) -> dict[str, Any]:
+        """Return the raw state.json payload, or an empty dict if missing or invalid."""
+        if not self.state_file.is_file():
+            return {}
+        try:
+            data = json.loads(self.state_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _write_state(self, data: dict[str, Any]) -> None:
+        """Atomically persist the raw state.json payload (tmp file + os.replace)."""
+        if self.state_file == STATE_FILE:
+            ensure_dirs()
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        data["updated_at"] = time.time()
+        tmp = self.state_file.with_name(
+            f"{self.state_file.name}.tmp-{os.getpid()}-{threading.get_ident()}"
+        )
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(tmp, self.state_file)
+
     def load_radio_autoplay(self) -> bool:
         """Read radio_autoplay preference from state.json (False if absent, True if unset in existing file)."""
         if not self.state_file.is_file():
             return False
-        try:
-            data = json.loads(self.state_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return False
-        if not isinstance(data, dict):
+        data = self._load_state()
+        if not data:
             return False
         return bool(data.get("radio_autoplay", True))
 
+    def load_shuffle(self) -> bool:
+        """Return True if shuffle mode is enabled in state.json."""
+        return bool(self._load_state().get("shuffle", False))
+
+    def load_repeat_mode(self) -> str:
+        """Return the persisted repeat mode ('off', 'all', or 'one')."""
+        mode = self._load_state().get("repeat_mode", "off")
+        return mode if mode in REPEAT_MODES else "off"
+
     def save_queue(self, tracks: list[Track], radio_autoplay: bool | None = None) -> None:
         """Persist the current track queue metadata and radio_autoplay state to disk."""
-        ensure_dirs()
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        data = self._load_state()
         if radio_autoplay is None:
-            resolved_radio = self.load_radio_autoplay() if self.state_file.is_file() else True
+            resolved_radio = bool(data.get("radio_autoplay", True)) if self.state_file.is_file() else True
         else:
             resolved_radio = bool(radio_autoplay)
-        payload = {
-            "queue": [t.to_dict() for t in tracks],
-            "radio_autoplay": resolved_radio,
-            "updated_at": time.time(),
-        }
-        self.state_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        data["queue"] = [t.to_dict() for t in tracks]
+        data["radio_autoplay"] = resolved_radio
+        self._write_state(data)
 
     def load_queue(self) -> list[Track]:
         """Load the persisted track queue metadata from disk."""
-        if not self.state_file.is_file():
-            return []
-        try:
-            data = json.loads(self.state_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return []
-        raw_queue = data.get("queue") if isinstance(data, dict) else None
+        raw_queue = self._load_state().get("queue")
         if not isinstance(raw_queue, list):
             return []
         tracks = [Track.from_dict(item) for item in raw_queue if isinstance(item, dict)]
         return self.liked_store.annotate(tracks)
 
+    def _load_original_queue(self) -> list[Track]:
+        raw = self._load_state().get("original_queue")
+        if not isinstance(raw, list):
+            return []
+        return [Track.from_dict(item) for item in raw if isinstance(item, dict)]
+
     def _update_queue_tracks(self, video_id: str, attr: str, value: Any) -> None:
         if not self.state_file.is_file() or not video_id:
             return
-        queue = self.load_queue()
-        changed = False
-        for track in queue:
-            if track.video_id == video_id and getattr(track, attr) != value:
-                setattr(track, attr, value)
-                changed = True
-        if changed:
-            self.save_queue(queue)
+        with self._playlist_lock:
+            data = self._load_state()
+            changed = False
+            for key in ("queue", "original_queue"):
+                items = data.get(key)
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    if isinstance(item, dict) and item.get("video_id") == video_id and item.get(attr) != value:
+                        item[attr] = value
+                        changed = True
+            if changed:
+                self._write_state(data)
 
     def sync_track_like(self, video_id: str, is_liked: bool) -> None:
         """Update is_liked flag in the persisted queue for matching video_id."""
@@ -209,57 +263,189 @@ class MPVPlayer:
         """Append unique tracks to the active mpv playlist and state.json without interrupting playback."""
         if not new_tracks or not self.is_running():
             return 0
-        queue = self.load_queue()
-        existing_ids = {t.video_id for t in queue if t.video_id}
-        unique_tracks: list[Track] = []
-        for track in new_tracks:
-            if track.video_id and track.video_id not in existing_ids:
-                existing_ids.add(track.video_id)
-                unique_tracks.append(track)
-        if not unique_tracks:
-            return 0
+        with self._playlist_lock:
+            queue = self.load_queue()
+            existing_ids = {t.video_id for t in queue if t.video_id}
+            unique_tracks: list[Track] = []
+            for track in new_tracks:
+                if track.video_id and track.video_id not in existing_ids:
+                    existing_ids.add(track.video_id)
+                    unique_tracks.append(track)
+            if not unique_tracks:
+                return 0
 
-        appended: list[Track] = []
-        for track in unique_tracks:
-            resp = self._ipc(["loadfile", track.url, "append"])
-            if resp.get("error") == "success":
-                appended.append(track)
+            appended: list[Track] = []
+            for track in unique_tracks:
+                resp = self._ipc(["loadfile", track.url, "append"])
+                if resp.get("error") == "success":
+                    appended.append(track)
 
-        if appended:
-            self.save_queue(queue + appended)
-        return len(appended)
+            if appended:
+                self.save_queue(queue + appended)
+                data = self._load_state()
+                if data.get("shuffle") and isinstance(data.get("original_queue"), list):
+                    data["original_queue"].extend(t.to_dict() for t in appended)
+                    self._write_state(data)
+            return len(appended)
+
+    # ----- Repeat -----------------------------------------------------------
+
+    def _apply_loop_props(self, mode: str) -> None:
+        """Mirror the repeat mode onto mpv loop-file / loop-playlist properties."""
+        if not self.is_running():
+            return
+        for prop, value in (
+            ("loop-file", "inf" if mode == "one" else "no"),
+            ("loop-playlist", "inf" if mode == "all" else "no"),
+        ):
+            try:
+                self._set_property(prop, value)
+            except MPVError:
+                pass
+
+    def set_repeat_mode(self, mode: str) -> str:
+        """Set repeat mode ('off', 'all', 'one'), persist it, and apply to mpv."""
+        clean = str(mode).strip().lower()
+        if clean not in REPEAT_MODES:
+            raise ValueError(f"Invalid repeat mode: {mode!r} (use off, all, or one).")
+        with self._playlist_lock:
+            data = self._load_state()
+            data["repeat_mode"] = clean
+            self._write_state(data)
+        self._apply_loop_props(clean)
+        return clean
+
+    def cycle_repeat(self) -> str:
+        """Cycle repeat mode off -> all -> one -> off and return the new mode."""
+        current = self.load_repeat_mode()
+        nxt = REPEAT_MODES[(REPEAT_MODES.index(current) + 1) % len(REPEAT_MODES)]
+        return self.set_repeat_mode(nxt)
+
+    # ----- Shuffle ----------------------------------------------------------
+
+    def _prefetch_upcoming(self, tracks: list[Track]) -> None:
+        upcoming_ids = [t.video_id for t in tracks[:3] if t.video_id and not t.local_path]
+        if upcoming_ids:
+            self.resolver.prefetch_async(upcoming_ids)
+
+    def set_shuffle(self, enabled: bool) -> bool:
+        """Enable or disable shuffle without interrupting the currently playing track."""
+        enabled = bool(enabled)
+        with self._playlist_lock:
+            data = self._load_state()
+            if bool(data.get("shuffle", False)) == enabled:
+                return enabled
+
+            queue = self.load_queue()
+            pos = self._get_property("playlist-pos", -1) if self.is_running() else -1
+            if not queue or not isinstance(pos, int) or not (0 <= pos < len(queue)):
+                data["shuffle"] = enabled
+                if not enabled:
+                    data.pop("original_queue", None)
+                self._write_state(data)
+                return enabled
+
+            current = queue[pos]
+            if enabled:
+                rest = queue[:pos] + queue[pos + 1 :]
+                self._rng.shuffle(rest)
+                self._ipc(["playlist-clear"])
+                loaded: list[Track] = [current]
+                for track in rest:
+                    if self._ipc(["loadfile", track.url, "append"]).get("error") == "success":
+                        loaded.append(track)
+                data = self._load_state()
+                data["queue"] = [t.to_dict() for t in loaded]
+                data["original_queue"] = [t.to_dict() for t in queue]
+                data["shuffle"] = True
+                self._write_state(data)
+                self._prefetch_upcoming(loaded[1:])
+                return True
+
+            original = self._load_original_queue() or list(queue)
+            original = self.liked_store.annotate(original)
+            k = next(
+                (i for i, t in enumerate(original) if t.video_id == current.video_id),
+                -1,
+            )
+            before = original[:k] if k >= 0 else []
+            after = original[k + 1 :] if k >= 0 else [t for t in original if t.video_id != current.video_id]
+
+            self._ipc(["playlist-clear"])
+            restored_before: list[Track] = []
+            for track in before:
+                if self._ipc(["loadfile", track.url, "append"]).get("error") != "success":
+                    continue
+                self._ipc(["playlist-move", len(restored_before) + 1, len(restored_before)])
+                restored_before.append(track)
+            restored_after: list[Track] = []
+            for track in after:
+                if self._ipc(["loadfile", track.url, "append"]).get("error") == "success":
+                    restored_after.append(track)
+
+            restored = restored_before + [current] + restored_after
+            data = self._load_state()
+            data["queue"] = [t.to_dict() for t in restored]
+            data.pop("original_queue", None)
+            data["shuffle"] = False
+            self._write_state(data)
+            self._prefetch_upcoming(restored_after)
+            return False
+
+    def toggle_shuffle(self) -> bool:
+        """Toggle shuffle mode and return the new state."""
+        return self.set_shuffle(not self.load_shuffle())
 
     def play_queue(
         self,
         tracks: list[Track],
         start_index: int = 0,
         radio_autoplay: bool = True,
+        preserve_order: bool = False,
     ) -> None:
-        """Replace the active playback queue and begin playing at start_index."""
+        """Replace the active playback queue and begin playing at start_index.
+
+        preserve_order=True reloads tracks exactly as given and keeps any saved shuffle
+        original_queue (used when restarting the daemon).
+        """
         if not tracks:
             raise ValueError("Cannot play an empty track queue.")
         if start_index < 0 or start_index >= len(tracks):
             start_index = 0
 
         self.ensure_daemon()
-        self.save_queue(tracks, radio_autoplay=radio_autoplay)
+        with self._playlist_lock:
+            original_order: list[Track] | None = None
+            if not preserve_order and self.load_shuffle() and len(tracks) > 1:
+                original_order = list(tracks)
+                chosen = tracks[start_index]
+                rest = tracks[:start_index] + tracks[start_index + 1 :]
+                self._rng.shuffle(rest)
+                tracks = [chosen] + rest
+                start_index = 0
 
-        self._ipc(["playlist-clear"])
-        for idx, track in enumerate(tracks):
-            mode = "replace" if idx == 0 else "append"
-            resp = self._ipc(["loadfile", track.url, mode])
-            if resp.get("error") != "success":
-                raise MPVError(f"Failed to load track {track.title!r}: {resp.get('error')}")
+            self.save_queue(tracks, radio_autoplay=radio_autoplay)
+            if not preserve_order:
+                data = self._load_state()
+                if original_order is not None:
+                    data["original_queue"] = [t.to_dict() for t in original_order]
+                else:
+                    data.pop("original_queue", None)
+                self._write_state(data)
+
+            self._ipc(["playlist-clear"])
+            for idx, track in enumerate(tracks):
+                mode = "replace" if idx == 0 else "append"
+                resp = self._ipc(["loadfile", track.url, mode])
+                if resp.get("error") != "success":
+                    raise MPVError(f"Failed to load track {track.title!r}: {resp.get('error')}")
 
         self._set_property("pause", False)
         if start_index > 0:
             self.play_index(start_index)
+        self._apply_loop_props(self.load_repeat_mode())
 
-        upcoming_ids = [
-            t.video_id for t in tracks[start_index + 1 : start_index + 4] if not t.local_path
-        ]
-        if upcoming_ids:
-            self.resolver.prefetch_async(upcoming_ids)
+        self._prefetch_upcoming(tracks[start_index + 1 : start_index + 4])
 
     def get_status(self) -> dict[str, Any]:
         """Return playback state, timing, volume, active track, and queue details."""
@@ -275,6 +461,10 @@ class MPVPlayer:
         core_idle = bool(self._get_property("core-idle", True))
 
         queue = self.load_queue()
+        state = self._load_state()
+        repeat_mode = state.get("repeat_mode", "off")
+        if repeat_mode not in REPEAT_MODES:
+            repeat_mode = "off"
         idx = int(playlist_pos) if isinstance(playlist_pos, int) else -1
         current_track = queue[idx] if 0 <= idx < len(queue) else None
         upcoming = queue[idx + 1 :] if 0 <= idx < len(queue) else []
@@ -295,6 +485,8 @@ class MPVPlayer:
             "upcoming": upcoming,
             "queue": queue,
             "radio_autoplay": self.load_radio_autoplay(),
+            "shuffle": bool(state.get("shuffle", False)),
+            "repeat_mode": repeat_mode,
         }
 
     def toggle_pause(self) -> bool:
@@ -386,6 +578,8 @@ class MPVPlayer:
 
     def stop(self) -> None:
         """Terminate the background mpv daemon and clean up its IPC socket."""
+        if self.socket_path == MPV_SOCKET_PATH:
+            self._maybe_stop_mpris()
         if self.is_running():
             try:
                 self._ipc(["quit"], timeout=1.0)
@@ -403,11 +597,24 @@ class MPVPlayer:
             except OSError:
                 pass
 
-    def replace_upcoming_entry(self, index: int, new_path: str) -> bool:
-        """Hot-swap an upcoming playlist entry with a local/preloaded file without interrupting playback."""
+    def replace_upcoming_entry(
+        self,
+        index: int,
+        new_path: str,
+        expected_video_id: str | None = None,
+    ) -> bool:
+        """Hot-swap an upcoming playlist entry with a local/preloaded file without interrupting playback.
+
+        When expected_video_id is given, the swap only happens if the persisted queue still has
+        that track at index (guards against stale preloads after shuffle reorders the playlist).
+        """
         if not new_path or not Path(new_path).is_file() or not self.is_running():
             return False
         with self._playlist_lock:
+            if expected_video_id is not None:
+                queue = self.load_queue()
+                if not (0 <= index < len(queue)) or queue[index].video_id != expected_video_id:
+                    return False
             current_pos = self._get_property("playlist-pos", -1)
             count = self._get_property("playlist-count", 0)
             if not isinstance(current_pos, int) or not isinstance(count, int):
@@ -439,6 +646,7 @@ class MPVPlayer:
                 queue,
                 start_index=pos_idx,
                 radio_autoplay=bool(status.get("radio_autoplay", False)),
+                preserve_order=True,
             )
             volume = status.get("volume")
             if isinstance(volume, (int, float)):
