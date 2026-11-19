@@ -5,13 +5,16 @@ from __future__ import annotations
 import json
 import socket
 import subprocess
+import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from ytm.config import MPV_SOCKET_PATH, STATE_FILE, ensure_dirs, get_ytdlp_path
 from ytm.liked import LikedStore
 from ytm.models import Track
 from ytm.resolver import StreamResolver
+from ytm.settings import SettingsStore
 
 
 class MPVError(RuntimeError):
@@ -26,11 +29,14 @@ class MPVPlayer:
         socket_path=MPV_SOCKET_PATH,
         state_file=STATE_FILE,
         liked_store: LikedStore | None = None,
+        settings_store: SettingsStore | None = None,
     ) -> None:
         self.socket_path = socket_path
         self.state_file = state_file
         self.liked_store = liked_store or LikedStore()
+        self.settings_store = settings_store or SettingsStore()
         self.resolver = StreamResolver()
+        self._playlist_lock = threading.Lock()
 
     def _ipc(self, command: list[Any], timeout: float = 2.0) -> dict[str, Any]:
         """Send a single JSON-IPC command to mpv and return its response object."""
@@ -98,6 +104,7 @@ class MPVPlayer:
             except OSError:
                 pass
 
+        settings = self.settings_store.load()
         cmd = [
             "mpv",
             "--no-video",
@@ -105,9 +112,16 @@ class MPVPlayer:
             "--force-window=no",
             f"--input-ipc-server={self.socket_path}",
             "--audio-client-name=ytm",
-            "--ytdl-format=bestaudio/best",
+            f"--ytdl-format={settings.ytdlp_format}",
             "--ytdl-raw-options=no-playlist=",
             f"--script-opts=ytdl_hook-ytdl_path={get_ytdlp_path()}",
+            "--cache=yes",
+            f"--demuxer-readahead-secs={settings.stream_buffer_secs}",
+            "--demuxer-max-bytes=64MiB",
+            "--prefetch-playlist=yes",
+            "--gapless-audio=yes",
+            "--network-timeout=30",
+            "--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=5",
         ]
         try:
             proc = subprocess.Popen(
@@ -388,3 +402,66 @@ class MPVPlayer:
                 self.socket_path.unlink()
             except OSError:
                 pass
+
+    def replace_upcoming_entry(self, index: int, new_path: str) -> bool:
+        """Hot-swap an upcoming playlist entry with a local/preloaded file without interrupting playback."""
+        if not new_path or not Path(new_path).is_file() or not self.is_running():
+            return False
+        with self._playlist_lock:
+            current_pos = self._get_property("playlist-pos", -1)
+            count = self._get_property("playlist-count", 0)
+            if not isinstance(current_pos, int) or not isinstance(count, int):
+                return False
+            if index <= current_pos or index >= count:
+                return False
+            try:
+                r_add = self._ipc(["loadfile", str(new_path), "append"])
+                if r_add.get("error") != "success":
+                    return False
+                r_mv = self._ipc(["playlist-move", count, index])
+                if r_mv.get("error") != "success":
+                    return False
+                r_rm = self._ipc(["playlist-remove", index + 1])
+                return r_rm.get("error") == "success"
+            except MPVError:
+                return False
+
+    def restart_daemon(self) -> bool:
+        """Restart the mpv daemon cleanly with updated settings, restoring queue and position."""
+        status = self.get_status()
+        self.stop()
+        self.ensure_daemon()
+
+        queue: list[Track] = status.get("queue") or []
+        pos_idx = int(status.get("playlist_pos", -1)) if status.get("running") else -1
+        if status.get("running") and queue and 0 <= pos_idx < len(queue):
+            self.play_queue(
+                queue,
+                start_index=pos_idx,
+                radio_autoplay=bool(status.get("radio_autoplay", False)),
+            )
+            volume = status.get("volume")
+            if isinstance(volume, (int, float)):
+                try:
+                    self._set_property("volume", float(volume))
+                except MPVError:
+                    pass
+            time_pos = float(status.get("time_pos", 0.0) or 0.0)
+            if time_pos > 1.0:
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline:
+                    if self._get_property("time-pos") is not None:
+                        break
+                    time.sleep(0.05)
+                try:
+                    resp = self._ipc(["seek", time_pos, "absolute"])
+                    if resp.get("error") != "success":
+                        time.sleep(0.08)
+                        self._ipc(["seek", time_pos, "absolute"])
+                except MPVError:
+                    pass
+            try:
+                self._set_property("pause", bool(status.get("paused", False)))
+            except MPVError:
+                pass
+        return True

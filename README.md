@@ -5,23 +5,25 @@ A high-contrast terminal music player built around YouTube Music (`ytmusicapi`),
 ## Features
 
 - Full-screen `btop`/`lazygit`-style interactive TUI (`ytm` or `ytm tui`) with Truecolor half-block album cover art (`#cover-box`) and a 7-row Unicode spectrum visualizer
+- `[6] Settings` view (`~/.config/ytm/config.json`) to control connectivity, audio quality, buffering, and background caching without cluttering the sidebar
+- Resilient streaming for slow connections: full-song RAM buffering (`--demuxer-readahead-secs=600`), FFmpeg auto-reconnect, rolling next-track preloading (`~/.cache/ytm/preload/`), optional Data Saver (`<=96k`) Opus quality, and polite sequential auto-caching of Liked Music (off by default)
 - Collection-only playback inside `[3] Liked Music`, `[4] Local Cache`, and `[5] Playlists` without injecting unrelated tracks, plus explicit `R` Radio Mix mode
 - Custom named playlists (`[5] Playlists`) persisted in `~/.config/ytm/playlists.json`
 - Safe like workflow: `l`/`L` are add-only, `x` removes (debounced), and `u` restores the last unliked track from undo history
 - Optional YouTube Music account link (`ytm auth`) to sync your Liked Music library and rate songs directly on your account
-- Hybrid local audio caching (`ytm download` or `d`/`D` in the TUI) storing audio in `~/Music/ytm` for instant offline playback
+- Hybrid local audio caching (`ytm download`, `ytm cache-liked`, or `d`/`D` in the TUI) storing audio in `~/Music/ytm` for instant offline playback
 - Persistent `mpv` background daemon over `/tmp/ytm-mpv.sock` so audio keeps playing after you detach or close your terminal
 
 ## TUI Keybindings
 
 | Key | Action |
 | --- | --- |
-| `1` - `5` / `Tab` | Switch views (Active Queue, Search Results, Liked Music, Local Cache, Playlists) |
+| `1` - `6` / `Tab` | Switch views (Active Queue, Search Results, Liked Music, Local Cache, Playlists, Settings) |
 | `/` | Focus YouTube Music search input |
-| `Esc` | Cancel input and return focus to the track table |
+| `Esc` | Cancel input and return focus to the active table |
 | `j` / `k` | Move cursor down / up |
 | `g` / `G` | Jump to top / bottom of table |
-| `Enter` / `o` | Play selected track (collection-only in `[3]`/`[4]`/`[5]`; Radio Mix in `[2]`) |
+| `Enter` / `o` | Play selected track (collection-only in `[3]`/`[4]`/`[5]`; Radio Mix in `[2]`) or toggle/run row in `[6] Settings` |
 | `a` | Play all tracks in the active view starting at the highlighted row (collection-only) |
 | `R` | Start a YouTube Music Radio mix seeded from the selected track |
 | `Space` | Toggle Play / Pause |
@@ -48,9 +50,9 @@ A high-contrast terminal music player built around YouTube Music (`ytmusicapi`),
 4. Paste into the prompt and end with `END` (or `Ctrl-D`).
 
 Other auth commands:
-- `ytm auth --status` — Check connection status
-- `ytm auth --sync` — Pull remote Liked Music into local store
-- `ytm auth --logout` — Remove saved credentials
+- `ytm auth --status` - Check connection status
+- `ytm auth --sync` - Pull remote Liked Music into local store
+- `ytm auth --logout` - Remove saved credentials
 
 ## Quick CLI Usage
 
@@ -61,6 +63,8 @@ ytm status
 ytm like
 ytm download
 ytm download "M83 Midnight City"
+ytm cache-liked
+ytm cache-liked --limit 25
 ytm auth --status
 ytm queue
 ytm next

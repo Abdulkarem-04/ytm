@@ -13,3 +13,11 @@ dist/
 headers_auth.json
 stream_cache.json
 state.json
+
+# Secrets, keys, and handoffs
+.env
+.env.*
+.agents/handoffs/
+*.key
+*.pem
+auth.json

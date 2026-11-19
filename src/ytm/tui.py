@@ -17,15 +17,27 @@ from textual.widgets import DataTable, Input, Static
 
 from ytm.api import YTMClient
 from ytm.art import CoverArtRenderer
+from ytm.cache_worker import BackgroundCacheManager, clean_error_text
 from ytm.config import MUSIC_DIR
-from ytm.downloader import TrackDownloader
+from ytm.downloader import TrackDownloader, dir_stats
 from ytm.liked import LikedStore
 from ytm.models import Track, format_duration
 from ytm.player import MPVError, MPVPlayer
 from ytm.playlists import PlaylistStore
+from ytm.settings import SettingsStore
 
 _AUDIO_EXTS = {".opus", ".m4a", ".webm", ".mp3", ".ogg", ".flac", ".wav"}
-_VIEW_ORDER = ("queue", "search", "liked", "local", "playlists")
+_VIEW_ORDER = ("queue", "search", "liked", "local", "playlists", "settings")
+_SETTINGS_KEYS = (
+    "auto_cache_liked",
+    "preload_next",
+    "preload_limit",
+    "audio_quality",
+    "stream_buffer_secs",
+    "clear_preload",
+    "restart_daemon",
+    "local_stats",
+)
 _SPECTRUM_CHARS = " ▁▂▃▄▅▆▇█"
 _SPECTRUM_ROWS = 7
 _SPECTRUM_COLORS = {
@@ -143,29 +155,33 @@ class YTMApp(App[None]):
         layout: vertical;
     }
 
-    #track-table {
+    #track-table, #settings-table {
         height: 1fr;
         background: #000000;
         color: #ffffff;
     }
 
-    #track-table > .datatable--header {
+    #settings-table {
+        display: none;
+    }
+
+    #track-table > .datatable--header, #settings-table > .datatable--header {
         background: #0a1428;
         color: #ffd43b;
         text-style: bold;
     }
 
-    #track-table > .datatable--cursor {
+    #track-table > .datatable--cursor, #settings-table > .datatable--cursor {
         background: #103252;
         color: #ffffff;
         text-style: bold;
     }
 
-    #track-table > .datatable--even-row {
+    #track-table > .datatable--even-row, #settings-table > .datatable--even-row {
         background: #05080f;
     }
 
-    #track-table > .datatable--odd-row {
+    #track-table > .datatable--odd-row, #settings-table > .datatable--odd-row {
         background: #000000;
     }
 
@@ -216,6 +232,7 @@ class YTMApp(App[None]):
         Binding("3", "view_liked", "Liked"),
         Binding("4", "view_local", "Local"),
         Binding("5", "view_playlists", "Playlists"),
+        Binding("6", "view_settings", "Settings"),
         Binding("tab", "next_view", "Cycle View", priority=True),
         Binding("j", "cursor_down", "Down"),
         Binding("k", "cursor_up", "Up"),
@@ -257,16 +274,33 @@ class YTMApp(App[None]):
         playlist_store: PlaylistStore | None = None,
         downloader: TrackDownloader | None = None,
         art_renderer: CoverArtRenderer | None = None,
+        settings_store: SettingsStore | None = None,
+        cache_manager: BackgroundCacheManager | None = None,
         music_dir: Path = MUSIC_DIR,
     ) -> None:
         super().__init__()
+        self.settings_store = settings_store or SettingsStore()
         self.liked_store = liked_store or LikedStore()
         self.playlist_store = playlist_store or PlaylistStore()
-        self.player = player or MPVPlayer(liked_store=self.liked_store)
+        self.player = player or MPVPlayer(
+            liked_store=self.liked_store,
+            settings_store=self.settings_store,
+        )
         self.client = client or YTMClient(liked_store=self.liked_store)
         self.music_dir = music_dir
-        self.downloader = downloader or TrackDownloader(music_dir=self.music_dir)
+        self.downloader = downloader or TrackDownloader(
+            music_dir=self.music_dir,
+            settings_store=self.settings_store,
+        )
         self.art_renderer = art_renderer or CoverArtRenderer()
+        self.cache_manager = cache_manager or BackgroundCacheManager(
+            downloader=self.downloader,
+            player=self.player,
+            liked_store=self.liked_store,
+            playlist_store=self.playlist_store,
+            settings_store=self.settings_store,
+            on_track_cached=self._on_bg_track_cached,
+        )
 
         self.active_view: str = "queue"
         self.last_query: str = ""
@@ -280,6 +314,7 @@ class YTMApp(App[None]):
 
         self.last_status: dict[str, Any] = {"running": False}
         self._table_signature: tuple[Any, ...] | None = None
+        self._settings_signature: tuple[Any, ...] | None = None
         self._bands: list[float] = [0.03] * _BAND_COUNT
         self._vis_phase: float = 0.0
         self._refilling_for_video_id: str | None = None
@@ -304,9 +339,10 @@ class YTMApp(App[None]):
                 yield Static(self._render_keys_markup(), id="keys-panel")
             with Vertical(id="main-pane"):
                 yield DataTable(id="track-table", cursor_type="row", zebra_stripes=True)
+                yield DataTable(id="settings-table", cursor_type="row", zebra_stripes=True)
                 yield Static(
                     "[#00e5ff]Ready.[/] Press [bold #ffd43b]/[/] to search, "
-                    "[bold #ffd43b]c[/] new playlist, [bold #ffd43b]q[/] detach.",
+                    "[bold #ffd43b]c[/] new playlist, [bold #ffd43b]6[/] settings, [bold #ffd43b]q[/] detach.",
                     id="main-status",
                 )
 
@@ -326,14 +362,23 @@ class YTMApp(App[None]):
 
         table = self.query_one("#track-table", DataTable)
         table.add_columns("#", "Title", "Artist", "Album", "Duration")
+
+        settings_table = self.query_one("#settings-table", DataTable)
+        settings_table.add_columns("Setting", "Value", "Description")
+        settings_table.display = False
+
         table.focus()
 
         self._reload_collections()
         self._refresh_status_tick()
         self._tick_visualizer()
+        self.cache_manager.start()
 
         self.set_interval(0.25, self._refresh_status_tick)
         self.set_interval(0.08, self._tick_visualizer)
+
+    def on_unmount(self) -> None:
+        self.cache_manager.stop()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if isinstance(self.focused, Input) and action != "focus_table":
@@ -343,7 +388,7 @@ class YTMApp(App[None]):
     def _render_keys_markup(self) -> str:
         return "\n".join(
             [
-                "[bold #ffd43b]1-5/Tab[/] [#ffffff]Views[/]   [bold #ffd43b]j/k[/] [#ffffff]Move[/]",
+                "[bold #ffd43b]1-6/Tab[/] [#ffffff]Views[/]   [bold #ffd43b]j/k[/] [#ffffff]Move[/]",
                 "[bold #ffd43b]g / G[/]   [#ffffff]Top/End[/] [bold #ffd43b]/[/]   [#ffffff]Search[/]",
                 "[bold #ffd43b]Enter[/]   [#ffffff]Play[/]    [bold #ffd43b]R[/]   [#ffffff]Radio[/]",
                 "[bold #ffd43b]a[/]       [#ffffff]ViewQ[/]   [bold #ffd43b]Spc[/] [#ffffff]Pause[/]",
@@ -428,28 +473,126 @@ class YTMApp(App[None]):
         if self.active_view == "playlists":
             pl_name = self.playlist_store.get_active_name() or "None"
             return f"|> [5] Playlist: {pl_name}"
+        if self.active_view == "settings":
+            return "|> [6] Settings"
         return "|> [4] Local Cache"
 
     def _update_nav_panel(self) -> None:
         pl_name = self.playlist_store.get_active_name()
-        items = [
+        items: list[tuple[str, str, str, int | None]] = [
             ("queue", "1", "Active Queue", len(self.queue_tracks)),
             ("search", "2", "Search Results", len(self.search_tracks)),
             ("liked", "3", "Liked Music", len(self.liked_tracks)),
             ("local", "4", "Local Cache", len(self.local_tracks)),
             ("playlists", "5", "Playlists", len(self.playlist_tracks)),
+            ("settings", "6", "Settings", None),
         ]
         lines: list[str] = []
         for key, num, label, count in items:
+            count_suffix = f" [bold #ffd43b]({count})[/]" if (count is not None and key == self.active_view) else (
+                f" [#4c6ef5]({count})[/]" if count is not None else ""
+            )
             if key == self.active_view:
                 lines.append(
-                    f"[bold #00ff87]|>[/] [bold #ffffff]\\[{num}] {label}[/] [bold #ffd43b]({count})[/]"
+                    f"[bold #00ff87]|>[/] [bold #ffffff]\\[{num}] {label}[/]{count_suffix}"
                 )
             else:
-                lines.append(f"   [#00e5ff]\\[{num}] {label}[/] [#4c6ef5]({count})[/]")
+                lines.append(f"   [#00e5ff]\\[{num}] {label}[/]{count_suffix}")
         pl_display = escape(_truncate(pl_name or "(press c to create)", 20))
         lines.append(f"   [bold #ff4d94]PL:[/] [#ffffff]{pl_display}[/]")
         self.query_one("#nav-panel", Static).update("\n".join(lines))
+
+    def _refresh_settings_table(self, force: bool = False) -> None:
+        settings = self.settings_store.load()
+        prog = self.cache_manager.get_progress()
+        preload_count, preload_bytes = dir_stats(self.downloader.preload_dir)
+        local_count, local_bytes = dir_stats(self.downloader.music_dir)
+
+        sig = (
+            settings.to_dict(),
+            prog["cached_liked"],
+            prog["total_liked"],
+            prog["caching_active"],
+            preload_count,
+            preload_bytes,
+            local_count,
+            local_bytes,
+        )
+        if not force and sig == self._settings_signature:
+            return
+        self._settings_signature = sig
+
+        main_pane = self.query_one("#main-pane", Vertical)
+        main_pane.border_title = "|> [6] Settings"
+
+        table = self.query_one("#settings-table", DataTable)
+        prev_row = table.cursor_row
+        table.clear()
+
+        auto_val = (
+            f"[ON] ({prog['cached_liked']}/{prog['total_liked']})"
+            if settings.auto_cache_liked
+            else f"[OFF] ({prog['cached_liked']}/{prog['total_liked']})"
+        )
+        auto_style = "bold #00ff87" if settings.auto_cache_liked else "bold #ff4d94"
+        preload_val = "[ON]" if settings.preload_next else "[OFF]"
+        preload_style = "bold #00ff87" if settings.preload_next else "bold #ff4d94"
+        quality_val = "Data Saver (<=96k)" if settings.audio_quality == "saver" else "Best Audio"
+        preload_mb = preload_bytes / (1024 * 1024)
+        local_mb = local_bytes / (1024 * 1024)
+
+        rows = [
+            (
+                "Auto-Cache Liked Music",
+                Text(auto_val, style=auto_style),
+                "Sequentially cache all Liked songs to ~/Music/ytm",
+            ),
+            (
+                "Gapless Next-Track Preload",
+                Text(preload_val, style=preload_style),
+                "Pre-download upcoming streamed track to remove gaps",
+            ),
+            (
+                "Preload Temp Cache Cap",
+                Text(f"{settings.preload_limit} tracks", style="bold #ffd43b"),
+                "Max temporary files in ~/.cache/ytm/preload",
+            ),
+            (
+                "Audio Quality",
+                Text(quality_val, style="bold #ffd43b"),
+                "Lower bitrate Opus stream for slow connections",
+            ),
+            (
+                "Stream RAM Buffer",
+                Text(f"{settings.stream_buffer_secs}s", style="bold #ffd43b"),
+                "mpv RAM readahead buffer + auto-reconnect",
+            ),
+            (
+                "[Action] Clear Temp Preload",
+                Text(f"{preload_count} files ({preload_mb:.1f} MB)", style="bold #00e5ff"),
+                "Delete temporary files in ~/.cache/ytm/preload",
+            ),
+            (
+                "[Action] Restart mpv Daemon",
+                Text("[RUN]", style="bold #00ff87"),
+                "Apply quality and buffer changes cleanly",
+            ),
+            (
+                "[Info] Permanent Local Cache",
+                Text(f"{local_count} files ({local_mb:.1f} MB)", style="bold #00ff87"),
+                "~/Music/ytm (auto-cached Liked + manual d/D)",
+            ),
+        ]
+        for label, val_text, desc in rows:
+            table.add_row(
+                Text(label, style="bold #ffffff"),
+                val_text,
+                Text(desc, style="#00e5ff"),
+            )
+
+        target_row = max(0, min(prev_row, len(rows) - 1))
+        table.move_cursor(row=target_row)
+        self._update_nav_panel()
 
     def _refresh_table(self, force: bool = False) -> None:
         tracks = self._current_view_tracks()
@@ -557,7 +700,15 @@ class YTMApp(App[None]):
             if self.client.authenticated
             else "[bold #00e5ff]\\[GUEST MODE][/]"
         )
-        self.query_one("#daemon-badge", Static).update(f"{daemon_badge}  {auth_badge}")
+        prog = self.cache_manager.get_progress()
+        cache_badge = (
+            f"  [bold #ffd43b]\\[CACHING: {prog['cached_liked']}/{prog['total_liked']}][/]"
+            if prog["caching_active"]
+            else ""
+        )
+        self.query_one("#daemon-badge", Static).update(
+            f"{daemon_badge}  {auth_badge}{cache_badge}"
+        )
         self._update_cover_art(track if running else None)
 
         now_box = self.query_one("#now-playing-box", Static)
@@ -652,6 +803,14 @@ class YTMApp(App[None]):
             total_count = int(status.get("playlist_count", 0) or 0)
             self.active_queue_pos = pos_idx
 
+            if (
+                self.settings_store.load().preload_next
+                and 0 <= pos_idx < len(self.queue_tracks) - 1
+            ):
+                self.cache_manager.request_preload(
+                    self.queue_tracks[pos_idx + 1], pos_idx + 1
+                )
+
             current_track: Track | None = status.get("current_track")
             if (
                 self.radio_autoplay
@@ -668,7 +827,10 @@ class YTMApp(App[None]):
             self.active_queue_pos = -1
 
         self._update_top_and_now_playing(status)
-        self._refresh_table()
+        if self.active_view == "settings":
+            self._refresh_settings_table()
+        else:
+            self._refresh_table()
 
     def _tick_visualizer(self) -> None:
         status = self.last_status
@@ -707,11 +869,48 @@ class YTMApp(App[None]):
 
         self.query_one("#visualizer-box", Static).update("\n".join(rows))
 
+    def _apply_local_path(self, video_id: str, local_str: str) -> None:
+        for col in (
+            self.queue_tracks,
+            self.search_tracks,
+            self.liked_tracks,
+            self.local_tracks,
+            self.playlist_tracks,
+        ):
+            for item in col:
+                if item.video_id == video_id:
+                    item.local_path = local_str
+        self._reload_collections()
+        if self.active_view == "settings":
+            self._refresh_settings_table(force=True)
+        else:
+            self._refresh_table(force=True)
+
+    def _on_bg_track_cached(self, track: Track, local_str: str) -> None:
+        self._safe_ui(self._apply_local_path, track.video_id, local_str)
+
+    def _active_table(self) -> DataTable:
+        if self.active_view == "settings":
+            return self.query_one("#settings-table", DataTable)
+        return self.query_one("#track-table", DataTable)
+
     def _switch_view(self, view: str) -> None:
-        if view in _VIEW_ORDER:
-            self.active_view = view
+        if view not in _VIEW_ORDER:
+            return
+        self.active_view = view
+        track_table = self.query_one("#track-table", DataTable)
+        settings_table = self.query_one("#settings-table", DataTable)
+        if view == "settings":
+            track_table.display = False
+            settings_table.display = True
+            self._refresh_settings_table(force=True)
+            settings_table.focus()
+        else:
+            settings_table.display = False
+            track_table.display = True
             self._reload_collections()
             self._refresh_table(force=True)
+            track_table.focus()
 
     def _selected_track(self) -> tuple[int, Track] | None:
         tracks = self._current_view_tracks()
@@ -841,21 +1040,22 @@ class YTMApp(App[None]):
             self._reload_collections()
             self._refresh_table(force=True)
             self._set_status(
-                f"[bold #00ff87]\\[PLAYLIST][/] Created '[bold #ffffff]{escape(created)}[/]' — "
+                f"[bold #00ff87]\\[PLAYLIST][/] Created '[bold #ffffff]{escape(created)}[/]' - "
                 "press [bold #ffd43b]m[/] on any song to add tracks."
             )
             return
 
         if not val:
-            self.query_one("#track-table", DataTable).focus()
+            self._active_table().focus()
             return
         self._set_status(f"[#00e5ff]Searching YouTube Music for[/] [bold #ffffff]{escape(val)}[/]...")
         self._run_bg(lambda: self._search_bg(val))
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        if event.data_table.id != "track-table":
-            return
-        self.action_play_selected()
+        if event.data_table.id == "settings-table":
+            self.action_activate_setting()
+        elif event.data_table.id == "track-table":
+            self.action_play_selected()
 
     def action_focus_search(self) -> None:
         self._input_mode = "search"
@@ -872,7 +1072,7 @@ class YTMApp(App[None]):
 
     def action_focus_table(self) -> None:
         self._reset_input_to_search()
-        self.query_one("#track-table", DataTable).focus()
+        self._active_table().focus()
 
     def action_view_queue(self) -> None:
         self._switch_view("queue")
@@ -889,27 +1089,99 @@ class YTMApp(App[None]):
     def action_view_playlists(self) -> None:
         self._switch_view("playlists")
 
+    def action_view_settings(self) -> None:
+        self._switch_view("settings")
+
     def action_next_view(self) -> None:
         idx = _VIEW_ORDER.index(self.active_view)
         self._switch_view(_VIEW_ORDER[(idx + 1) % len(_VIEW_ORDER)])
 
     def action_cursor_down(self) -> None:
-        self.query_one("#track-table", DataTable).action_cursor_down()
+        self._active_table().action_cursor_down()
 
     def action_cursor_up(self) -> None:
-        self.query_one("#track-table", DataTable).action_cursor_up()
+        self._active_table().action_cursor_up()
 
     def action_cursor_top(self) -> None:
-        table = self.query_one("#track-table", DataTable)
+        table = self._active_table()
         if table.row_count > 0:
             table.move_cursor(row=0)
 
     def action_cursor_bottom(self) -> None:
-        table = self.query_one("#track-table", DataTable)
+        table = self._active_table()
         if table.row_count > 0:
             table.move_cursor(row=table.row_count - 1)
 
+    def action_activate_setting(self) -> None:
+        table = self.query_one("#settings-table", DataTable)
+        row = table.cursor_row
+        if not (0 <= row < len(_SETTINGS_KEYS)):
+            return
+        key = _SETTINGS_KEYS[row]
+
+        if key in (
+            "auto_cache_liked",
+            "preload_next",
+            "preload_limit",
+            "audio_quality",
+            "stream_buffer_secs",
+        ):
+            updated = self.settings_store.cycle(key)
+            self.cache_manager.wake()
+            self._refresh_settings_table(force=True)
+            if key in ("audio_quality", "stream_buffer_secs"):
+                val_label = (
+                    f"{updated.stream_buffer_secs}s"
+                    if key == "stream_buffer_secs"
+                    else updated.audio_quality
+                )
+                self._set_status(
+                    f"[bold #00ff87]\\[SETTINGS][/] {key} = [bold #ffffff]{val_label}[/] "
+                    "(select 'Restart mpv Daemon' below to apply now)."
+                )
+            else:
+                val_str = str(getattr(updated, key))
+                self._set_status(
+                    f"[bold #00ff87]\\[SETTINGS][/] {key} = [bold #ffffff]{val_str}[/]."
+                )
+        elif key == "clear_preload":
+            removed = self.downloader.clear_preload()
+            self._refresh_settings_table(force=True)
+            self._set_status(
+                f"[bold #00ff87]\\[CACHE][/] Cleared {removed} temporary preload files."
+            )
+        elif key == "restart_daemon":
+            self._set_status("[#00e5ff]Restarting mpv daemon with current settings...[/]")
+
+            def _restart_bg() -> None:
+                try:
+                    self.player.restart_daemon()
+                except MPVError as exc:
+                    self._safe_ui(
+                        self._set_status,
+                        f"[bold #ff4d94]Restart error:[/] {escape(clean_error_text(exc))}",
+                    )
+                    return
+
+                def _done() -> None:
+                    self._refresh_status_tick()
+                    self._refresh_settings_table(force=True)
+                    self._set_status(
+                        "[bold #00ff87]\\[DAEMON][/] Restarted mpv with current audio quality and buffer settings."
+                    )
+
+                self._safe_ui(_done)
+
+            self._run_bg(_restart_bg)
+        elif key == "local_stats":
+            self._set_status(
+                f"[#00e5ff]Permanent Local Cache folder:[/] [bold #ffffff]{escape(str(self.downloader.music_dir))}[/]"
+            )
+
     def action_play_selected(self) -> None:
+        if self.active_view == "settings":
+            self.action_activate_setting()
+            return
         selection = self._selected_track()
         if selection is None:
             self._set_status("[bold #ffd43b]No track selected.[/]")
@@ -1177,7 +1449,7 @@ class YTMApp(App[None]):
         except Exception as exc:
             self._safe_ui(
                 self._set_status,
-                f"[bold #ff4d94]Download error:[/] {escape(str(exc))}",
+                f"[bold #ff4d94]Download error:[/] {escape(clean_error_text(exc))}",
             )
             return
 
@@ -1187,18 +1459,7 @@ class YTMApp(App[None]):
         self.player.sync_track_local_path(track.video_id, local_str)
 
         def _done() -> None:
-            for col in (
-                self.queue_tracks,
-                self.search_tracks,
-                self.liked_tracks,
-                self.local_tracks,
-                self.playlist_tracks,
-            ):
-                for item in col:
-                    if item.video_id == track.video_id:
-                        item.local_path = local_str
-            self._reload_collections()
-            self._refresh_table(force=True)
+            self._apply_local_path(track.video_id, local_str)
             self._refresh_status_tick()
             self._set_status(
                 f"[bold #00ff87]\\[CACHED][/] Saved [bold #ffffff]{escape(track.title)}[/] to {escape(str(self.music_dir))}"
@@ -1236,7 +1497,7 @@ class YTMApp(App[None]):
             except Exception as exc:
                 self._safe_ui(
                     self._set_status,
-                    f"[bold #ff4d94]Sync error:[/] {escape(str(exc))}",
+                    f"[bold #ff4d94]Sync error:[/] {escape(clean_error_text(exc))}",
                 )
                 return
 
@@ -1289,9 +1550,11 @@ class YTMApp(App[None]):
         self._set_status(f"[bold #ffd43b]Volume: {int(round(vol))}%[/]")
 
     def action_detach_quit(self) -> None:
+        self.cache_manager.stop()
         self.exit()
 
     def action_stop_quit(self) -> None:
+        self.cache_manager.stop()
         self.player.stop()
         self.exit()
 

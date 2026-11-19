@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from typing import Any
 
 from rich.console import Console
@@ -15,11 +16,14 @@ from rich.text import Text
 from ytm import __version__
 from ytm.api import YTMClient
 from ytm.auth import remove_auth, run_interactive_auth
+from ytm.cache_worker import clean_error_text
 from ytm.config import AUTH_HEADERS_FILE
 from ytm.downloader import TrackDownloader
 from ytm.liked import LikedStore
 from ytm.models import Track, format_duration
 from ytm.player import MPVError, MPVPlayer
+from ytm.playlists import PlaylistStore
+from ytm.settings import SettingsStore
 from ytm.tui import run_tui
 
 console = Console()
@@ -464,6 +468,73 @@ def _cmd_auth(args: argparse.Namespace) -> int:
     return run_interactive_auth(console)
 
 
+def _cmd_cache_liked(args: argparse.Namespace) -> int:
+    store = LikedStore()
+    playlists = PlaylistStore()
+    settings_store = SettingsStore()
+    player = MPVPlayer(liked_store=store, settings_store=settings_store)
+    downloader = TrackDownloader(settings_store=settings_store)
+
+    pending = [
+        t
+        for t in store.list_tracks()
+        if t.video_id and downloader.find_existing(t.video_id) is None
+    ]
+    if args.limit is not None and args.limit > 0:
+        pending = pending[: args.limit]
+
+    if not pending:
+        console.print(
+            f"[bold bright_green]\\[CACHED][/bold bright_green] "
+            f"All liked tracks are already cached in [bright_cyan]{escape(str(downloader.music_dir))}[/bright_cyan]."
+        )
+        return 0
+
+    total = len(pending)
+    cached_count = 0
+    for idx, track in enumerate(pending, 1):
+        console.print(
+            f"[bright_cyan]\\[{idx}/{total}][/bright_cyan] "
+            f"Caching [bold bright_white]{escape(track.title)}[/bold bright_white] "
+            f"[bright_cyan]by {escape(track.artist)}[/bright_cyan]..."
+        )
+        try:
+            saved = downloader.download(track)
+        except KeyboardInterrupt:
+            console.print(
+                f"\n[bold bright_yellow]Interrupted after caching {cached_count}/{total} tracks.[/bold bright_yellow]"
+            )
+            return 130
+        except Exception as exc:
+            console.print(
+                f"[bold bright_yellow]Skipped:[/bold bright_yellow] {escape(clean_error_text(exc))}"
+            )
+        else:
+            local_str = str(saved)
+            store.update_local_path(track.video_id, local_str)
+            playlists.update_local_path(track.video_id, local_str)
+            player.sync_track_local_path(track.video_id, local_str)
+            cached_count += 1
+            console.print(
+                f"[bold bright_green]\\[SAVED][/bold bright_green] {escape(local_str)}"
+            )
+
+        if idx < total:
+            try:
+                time.sleep(1.0)
+            except KeyboardInterrupt:
+                console.print(
+                    f"\n[bold bright_yellow]Interrupted after caching {cached_count}/{total} tracks.[/bold bright_yellow]"
+                )
+                return 130
+
+    console.print(
+        f"[bold bright_green]\\[DONE][/bold bright_green] "
+        f"Cached [bold bright_white]{cached_count}[/bold bright_white]/{total} liked tracks."
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the top-level CLI argument parser."""
     parser = argparse.ArgumentParser(
@@ -546,6 +617,18 @@ def build_parser() -> argparse.ArgumentParser:
     auth_grp.add_argument("--sync", action="store_true", help="Sync Liked Music from YouTube Music")
     auth_grp.add_argument("--logout", action="store_true", help="Remove saved auth credentials")
     p_auth.set_defaults(func=_cmd_auth)
+
+    p_cache_liked = sub.add_parser(
+        "cache-liked",
+        help="Politely download uncached Liked Music tracks into ~/Music/ytm",
+    )
+    p_cache_liked.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional maximum number of tracks to cache in this run",
+    )
+    p_cache_liked.set_defaults(func=_cmd_cache_liked)
 
     return parser
 
