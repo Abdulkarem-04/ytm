@@ -162,7 +162,7 @@ def test_tui_phase3_spectrum_setting_cycle(tmp_path: Path) -> None:
             await pilot.pause()
 
             settings_table = app.query_one("#settings-table", DataTable)
-            assert settings_table.row_count == 10
+            assert settings_table.row_count == 11
 
             # Navigate to row 6 (Spectrum Mode) and cycle fft -> simulated -> off
             settings_table.move_cursor(row=6)

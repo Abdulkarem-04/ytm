@@ -29,7 +29,7 @@ from ytm.lyrics import LyricsData, LyricsProvider, active_line_index
 from ytm.models import Track, format_duration
 from ytm.player import MPVError, MPVPlayer
 from ytm.playlists import PlaylistStore
-from ytm.settings import SettingsStore
+from ytm.settings import SOUND_PROFILE_LABELS, SOUND_PROFILE_SHORT, SettingsStore
 from ytm.spectrum import PipeWireSpectrumAnalyzer
 
 _AUDIO_EXTS = {".opus", ".m4a", ".webm", ".mp3", ".ogg", ".flac", ".wav"}
@@ -42,6 +42,7 @@ _SETTINGS_KEYS = (
     "stream_buffer_secs",
     "mpris_enabled",
     "spectrum_mode",
+    "sound_profile",
     "clear_preload",
     "restart_daemon",
     "local_stats",
@@ -409,6 +410,7 @@ class YTMApp(App[None]):
         Binding("r", "replay_track", "Replay"),
         Binding("S", "toggle_shuffle", "Shuffle"),
         Binding("w", "cycle_repeat", "Repeat"),
+        Binding("E", "cycle_sound_profile", "Sound EQ"),
         Binding("backspace", "go_back", "Back"),
         Binding("h", "go_back", "Back"),
         Binding("e", "rename_playlist", "Rename Playlist"),
@@ -635,6 +637,7 @@ class YTMApp(App[None]):
                 "[bold #ffd43b]c / m[/]   [#ffffff]New / Add Playlist[/]",
                 "[bold #ffd43b], / .[/]   [#ffffff]Switch Playlist[/]",
                 "[bold #ffd43b]e / h[/]   [#ffffff]Rename PL / Back[/]",
+                "[bold #ffd43b]E[/]       [#ffffff]Sound EQ (Bass/Clarity)[/]",
                 "[bold #ffd43b]d / s[/]   [#ffffff]Cache / Sync YTM[/]",
                 "[bold #ffd43b]\\[ ] - +[/] [#ffffff]Seek/Vol[/] [bold #ffd43b]q/Q[/] [#ffffff]Quit[/]",
             ]
@@ -818,6 +821,8 @@ class YTMApp(App[None]):
         spec_val, spec_style = spec_labels.get(
             settings.spectrum_mode, (settings.spectrum_mode, "bold #ffd43b")
         )
+        eq_val = SOUND_PROFILE_LABELS.get(settings.sound_profile, settings.sound_profile)
+        eq_style = "bold #4c6ef5" if settings.sound_profile == "flat" else "bold #00ff87"
         preload_mb = preload_bytes / (1024 * 1024)
         local_mb = local_bytes / (1024 * 1024)
 
@@ -856,6 +861,11 @@ class YTMApp(App[None]):
                 "Spectrum Mode",
                 Text(spec_val, style=spec_style),
                 "Beat-reactive volume-independent FFT or simulated wave",
+            ),
+            (
+                "Sound Enhancer / EQ",
+                Text(eq_val, style=eq_style),
+                "Zero-latency bass, sensitivity, and clarity DSP (press E anywhere)",
             ),
             (
                 "[Action] Clear Temp Preload",
@@ -1214,7 +1224,7 @@ class YTMApp(App[None]):
         bar_w = max(12, min(46, inner_w - 22))
         hints = (
             "[bold #ffd43b]Spc[/] Pause  [bold #ffd43b]n/p[/] Next/Prev  "
-            "[bold #ffd43b]S/w[/] Shuf/Rep  [bold #ffd43b]y[/] Lyrics  "
+            "[bold #ffd43b]S/w[/] Shuf/Rep  [bold #ffd43b]E[/] EQ  [bold #ffd43b]y[/] Lyrics  "
             "[bold #ffd43b]z/Esc[/] Full UI"
         )
 
@@ -1272,6 +1282,12 @@ class YTMApp(App[None]):
             if self.repeat_mode in ("all", "one")
             else ""
         )
+        eq_profile = self.settings_store.load().sound_profile
+        eq_tag = (
+            f"  [bold #00ff87]\\[EQ: {SOUND_PROFILE_SHORT.get(eq_profile, eq_profile.upper())}][/]"
+            if eq_profile != "flat"
+            else ""
+        )
 
         focus_now.border_title = "|> Focus Player"
         focus_now.update(
@@ -1283,7 +1299,7 @@ class YTMApp(App[None]):
                     f"[bold #ff4d94]Album:[/]  [#ffffff]{album_safe}[/]",
                     "",
                     f"{bar}  [bold #ffffff]{timing}[/]",
-                    f"[bold #ffd43b]Vol: {volume}%[/]  [bold #00e5ff]Track: {track_counter}[/]  {mode_tag}{shuffle_tag}{repeat_tag}{pl_info}",
+                    f"[bold #ffd43b]Vol: {volume}%[/]  [bold #00e5ff]Track: {track_counter}[/]  {mode_tag}{shuffle_tag}{repeat_tag}{eq_tag}{pl_info}",
                     "",
                     hints,
                 ]
@@ -1375,6 +1391,12 @@ class YTMApp(App[None]):
             if self.repeat_mode in ("all", "one")
             else ""
         )
+        eq_profile = self.settings_store.load().sound_profile
+        eq_tag = (
+            f"  [bold #00ff87]\\[EQ: {SOUND_PROFILE_SHORT.get(eq_profile, eq_profile.upper())}][/]"
+            if eq_profile != "flat"
+            else ""
+        )
 
         now_box.border_title = "|> Now Playing"
         now_box.update(
@@ -1383,7 +1405,7 @@ class YTMApp(App[None]):
                     f"{state_tag} {source_tag}{liked_tag}  [bold #ffffff]{title_safe}[/]",
                     f"[bold #00e5ff]Artist:[/] [bold #ffffff]{artist_safe}[/]   [bold #ff4d94]Album:[/] [#ffffff]{album_safe}[/]",
                     f"{bar}  [bold #ffffff]{timing}[/]  [bold #ffd43b]Vol: {volume}%[/]",
-                    f"{mode_tag}{shuffle_tag}{repeat_tag}  [bold #00e5ff]Track: {track_counter}[/]{pl_info}",
+                    f"{mode_tag}{shuffle_tag}{repeat_tag}{eq_tag}  [bold #00e5ff]Track: {track_counter}[/]{pl_info}",
                 ]
             )
         )
@@ -2129,11 +2151,23 @@ class YTMApp(App[None]):
             "stream_buffer_secs",
             "mpris_enabled",
             "spectrum_mode",
+            "sound_profile",
         ):
             updated = self.settings_store.cycle(key)
             self.cache_manager.wake()
             self._refresh_settings_table(force=True)
-            if key == "mpris_enabled":
+            if key == "sound_profile":
+                try:
+                    self.player.apply_sound_profile(updated.sound_profile)
+                except MPVError as exc:
+                    self._set_status(f"[bold #ff4d94]{escape(str(exc))}[/]")
+                    return
+                self._refresh_status_tick()
+                label = SOUND_PROFILE_LABELS.get(updated.sound_profile, updated.sound_profile)
+                self._set_status(
+                    f"[bold #00ff87]\\[SOUND EQ][/] Profile: [bold #ffffff]{escape(label)}[/]."
+                )
+            elif key == "mpris_enabled":
                 if updated.mpris_enabled:
                     self._run_bg(self.player._maybe_start_mpris)
                     self._set_status(
@@ -2334,6 +2368,20 @@ class YTMApp(App[None]):
         self.repeat_mode = mode
         self._refresh_status_tick()
         self._set_status(f"[bold #ff4d94]\\[REPEAT: {mode.upper()}][/]")
+
+    def action_cycle_sound_profile(self) -> None:
+        try:
+            profile = self.player.cycle_sound_profile()
+        except (MPVError, ValueError) as exc:
+            self._set_status(f"[bold #ff4d94]{escape(str(exc))}[/]")
+            return
+        if self.active_view == "settings":
+            self._refresh_settings_table(force=True)
+        self._refresh_status_tick()
+        label = SOUND_PROFILE_LABELS.get(profile, profile)
+        self._set_status(
+            f"[bold #00ff87]\\[SOUND EQ][/] Profile: [bold #ffffff]{escape(label)}[/]"
+        )
 
     def action_start_radio(self) -> None:
         selection = self._selected_track()

@@ -14,6 +14,61 @@ PRELOAD_LIMIT_CHOICES = (5, 10, 20)
 AUDIO_QUALITY_CHOICES = ("best", "saver")
 STREAM_BUFFER_CHOICES = (60, 300, 600)
 SPECTRUM_MODE_CHOICES = ("fft", "simulated", "off")
+SOUND_PROFILE_CHOICES = ("flat", "loudness", "deep_bass", "clarity", "dynamic")
+
+SOUND_PROFILE_LABELS: dict[str, str] = {
+    "flat": "Flat (Original)",
+    "loudness": "Bass & Sensitivity (Loudness)",
+    "deep_bass": "Deep Bass & Warmth",
+    "clarity": "Vocal & Detail Clarity",
+    "dynamic": "Night Dynamic Boost",
+}
+
+SOUND_PROFILE_SHORT: dict[str, str] = {
+    "flat": "FLAT",
+    "loudness": "BASS+SENS",
+    "deep_bass": "DEEP BASS",
+    "clarity": "CLARITY",
+    "dynamic": "NIGHT DYN",
+}
+
+SOUND_PROFILE_FILTERS: dict[str, str] = {
+    "flat": "",
+    "loudness": (
+        "lavfi=[volume=-2.5dB,"
+        "equalizer=f=50:width_type=o:w=1.1:g=8.0,"
+        "equalizer=f=105:width_type=o:w=0.85:g=5.5,"
+        "alimiter=limit=0.96:attack=5:release=60:level=disabled]"
+    ),
+    "deep_bass": (
+        "lavfi=[volume=-4.5dB,"
+        "equalizer=f=55:width_type=o:w=1.2:g=7.5,"
+        "equalizer=f=110:width_type=o:w=1.0:g=5.5,"
+        "equalizer=f=260:width_type=o:w=1.0:g=-2.5,"
+        "equalizer=f=1800:width_type=o:w=1.2:g=-1.5,"
+        "equalizer=f=8500:width_type=o:w=1.5:g=2.0,"
+        "alimiter=limit=0.95:level=disabled]"
+    ),
+    "clarity": (
+        "lavfi=[volume=-3.0dB,"
+        "equalizer=f=65:width_type=o:w=1.2:g=3.0,"
+        "equalizer=f=240:width_type=o:w=1.0:g=-2.5,"
+        "equalizer=f=3200:width_type=o:w=1.2:g=3.5,"
+        "equalizer=f=9000:width_type=o:w=1.5:g=4.5,"
+        "crystalizer=i=1.6,"
+        "extrastereo=m=1.18,"
+        "alimiter=limit=0.95:level=disabled]"
+    ),
+    "dynamic": (
+        "lavfi=[volume=-2.5dB,"
+        "equalizer=f=60:width_type=o:w=1.2:g=5.5,"
+        "equalizer=f=120:width_type=o:w=1.0:g=3.5,"
+        "equalizer=f=250:width_type=o:w=1.0:g=-2.0,"
+        "equalizer=f=8000:width_type=o:w=1.5:g=3.0,"
+        "acompressor=threshold=-22dB:ratio=2.5:attack=15:release=250:makeup=2.0,"
+        "alimiter=limit=0.95:level=disabled]"
+    ),
+}
 
 _CYCLE_MAP: dict[str, tuple[Any, ...]] = {
     "auto_cache_liked": (False, True),
@@ -23,6 +78,7 @@ _CYCLE_MAP: dict[str, tuple[Any, ...]] = {
     "stream_buffer_secs": STREAM_BUFFER_CHOICES,
     "mpris_enabled": (False, True),
     "spectrum_mode": SPECTRUM_MODE_CHOICES,
+    "sound_profile": SOUND_PROFILE_CHOICES,
 }
 
 
@@ -37,6 +93,7 @@ class AppSettings:
     stream_buffer_secs: int = 600
     mpris_enabled: bool = True
     spectrum_mode: str = "fft"
+    sound_profile: str = "flat"
 
     @property
     def ytdlp_format(self) -> str:
@@ -44,6 +101,11 @@ class AppSettings:
         if self.audio_quality == "saver":
             return "bestaudio[abr<=96]/bestaudio/best"
         return "bestaudio/best"
+
+    @property
+    def mpv_af(self) -> str:
+        """Return the mpv lavfi filter chain string for the active sound_profile."""
+        return SOUND_PROFILE_FILTERS.get(self.sound_profile, "")
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize settings to a JSON-compatible dictionary."""
@@ -82,6 +144,9 @@ class AppSettings:
         raw_spec = str(data.get("spectrum_mode", defaults.spectrum_mode)).lower()
         spectrum_mode = raw_spec if raw_spec in SPECTRUM_MODE_CHOICES else defaults.spectrum_mode
 
+        raw_eq = str(data.get("sound_profile", defaults.sound_profile)).lower()
+        sound_profile = raw_eq if raw_eq in SOUND_PROFILE_CHOICES else defaults.sound_profile
+
         return cls(
             auto_cache_liked=auto_cache_liked,
             preload_next=preload_next,
@@ -90,6 +155,7 @@ class AppSettings:
             stream_buffer_secs=stream_buffer_secs,
             mpris_enabled=mpris_enabled,
             spectrum_mode=spectrum_mode,
+            sound_profile=sound_profile,
         )
 
 

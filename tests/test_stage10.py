@@ -19,7 +19,7 @@ from ytm.lyrics import LyricLine, LyricsData, LyricsProvider, active_line_index,
 from ytm.models import Track
 from ytm.player import MPVPlayer
 from ytm.playlists import PlaylistStore
-from ytm.settings import SettingsStore
+from ytm.settings import SOUND_PROFILE_CHOICES, SOUND_PROFILE_FILTERS, SettingsStore
 from ytm.tui import YTMApp
 
 
@@ -176,6 +176,7 @@ class _DummyPlayer(MPVPlayer):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.mock_time_pos = 1.0
+        self.mock_props: dict[str, Any] = {}
         self.mock_track = Track(
             video_id="focusVid01",
             title="Synthwave Anthem",
@@ -188,6 +189,9 @@ class _DummyPlayer(MPVPlayer):
 
     def is_running(self) -> bool:
         return True
+
+    def _set_property(self, prop: str, value: Any) -> None:
+        self.mock_props[prop] = value
 
     def get_status(self) -> dict[str, Any]:
         return {
@@ -363,3 +367,100 @@ def test_cli_focus_flag_parsing() -> None:
     sub_focus = parser.parse_args(["tui", "--focus"])
     assert sub_focus.focus is True
     assert sub_focus.command == "tui"
+
+    eq_cycle = parser.parse_args(["eq"])
+    assert eq_cycle.command == "eq"
+    assert eq_cycle.profile == "cycle"
+
+    eq_set = parser.parse_args(["eq", "loudness"])
+    assert eq_set.profile == "loudness"
+
+
+def test_sound_profile_live_mpv_and_tui_hotkey(tmp_path: Path) -> None:
+    import math
+    import struct
+    import wave
+
+    wav_path = tmp_path / "tone.wav"
+    sr = 44100
+    frames = int(sr * 1.5)
+    with wave.open(str(wav_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        samples = bytearray()
+        for idx in range(frames):
+            val = int(8000 * math.sin(2.0 * math.pi * 220.0 * idx / sr))
+            samples.extend(struct.pack("<h", val))
+        wf.writeframes(bytes(samples))
+
+    sock_path = Path(f"/tmp/ytm-test-s10-eq-{os.getpid()}.sock")
+    settings_store = SettingsStore(settings_file=tmp_path / "config.json")
+    liked_store = LikedStore(liked_file=tmp_path / "liked.json")
+    playlist_store = PlaylistStore(playlists_file=tmp_path / "playlists.json")
+    player = MPVPlayer(
+        socket_path=sock_path,
+        state_file=tmp_path / "state.json",
+        liked_store=liked_store,
+        settings_store=settings_store,
+    )
+
+    try:
+        player.play_queue(
+            [
+                Track(
+                    video_id="eqTest01",
+                    title="EQ Test Track",
+                    artist="Test Synth",
+                    duration="00:02",
+                    duration_seconds=2,
+                    local_path=str(wav_path),
+                )
+            ],
+            start_index=0,
+            radio_autoplay=False,
+        )
+        assert player.get_status()["sound_profile"] == "flat"
+
+        for expected in SOUND_PROFILE_CHOICES[1:] + ("flat",):
+            applied = player.cycle_sound_profile()
+            assert applied == expected
+            af_prop = player._get_property("af")
+            if expected == "flat":
+                assert af_prop in ([], "", None)
+            else:
+                assert isinstance(af_prop, list) and len(af_prop) >= 1
+                assert SOUND_PROFILE_FILTERS[expected].startswith("lavfi=")
+    finally:
+        player.stop()
+
+    # TUI hotkey E cycles sound_profile and updates Focus / Now Playing badge
+    dummy_player = _DummyPlayer(
+        socket_path=Path(f"/tmp/ytm-test-s10-eq-tui-{os.getpid()}.sock"),
+        state_file=tmp_path / "state2.json",
+        liked_store=liked_store,
+        settings_store=settings_store,
+    )
+
+    async def _run_tui_check() -> None:
+        app = YTMApp(
+            player=dummy_player,
+            client=_DummyClient(),  # type: ignore[arg-type]
+            liked_store=liked_store,
+            playlist_store=playlist_store,
+            art_renderer=CoverArtRenderer(covers_dir=tmp_path / "covers"),
+            settings_store=settings_store,
+            music_dir=tmp_path / "music",
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert settings_store.load().sound_profile == "flat"
+            await pilot.press("E")
+            await pilot.pause()
+            assert settings_store.load().sound_profile == "loudness"
+            assert dummy_player.mock_props.get("af") == SOUND_PROFILE_FILTERS["loudness"]
+            now_text = str(app.query_one("#now-playing-box", Static).render())
+            assert "[EQ: BASS+SENS]" in now_text
+            await pilot.press("q")
+
+    asyncio.run(_run_tui_check())

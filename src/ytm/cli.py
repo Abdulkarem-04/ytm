@@ -23,7 +23,12 @@ from ytm.liked import LikedStore
 from ytm.models import Track, format_duration
 from ytm.player import MPVError, MPVPlayer
 from ytm.playlists import PlaylistStore
-from ytm.settings import SettingsStore
+from ytm.settings import (
+    SOUND_PROFILE_CHOICES,
+    SOUND_PROFILE_LABELS,
+    SOUND_PROFILE_SHORT,
+    SettingsStore,
+)
 from ytm.tui import run_tui
 
 console = Console()
@@ -92,6 +97,12 @@ def _render_now_playing(status: dict[str, Any]) -> None:
         if repeat_mode in ("all", "one")
         else ""
     )
+    eq_profile = str(status.get("sound_profile", "flat"))
+    eq_tag = (
+        f" [bold bright_green]\\[EQ: {SOUND_PROFILE_SHORT.get(eq_profile, eq_profile.upper())}][/bold bright_green]"
+        if eq_profile != "flat"
+        else ""
+    )
 
     bar = _build_progress_bar(time_pos, duration)
     timing = f"{format_duration(time_pos)} / {format_duration(duration)}"
@@ -102,7 +113,7 @@ def _render_now_playing(status: dict[str, Any]) -> None:
     )
 
     body = (
-        f"{state_tag}{liked_tag}{source_tag}{shuffle_tag}{repeat_tag}  "
+        f"{state_tag}{liked_tag}{source_tag}{shuffle_tag}{repeat_tag}{eq_tag}  "
         f"[bold bright_white]{escape(track.title)}[/bold bright_white]\n"
         f"[bright_cyan]Artist:[/bright_cyan] [bold bright_cyan]{escape(track.artist)}[/bold bright_cyan]\n"
         f"{album_line}"
@@ -346,6 +357,18 @@ def _cmd_repeat(args: argparse.Namespace) -> int:
     else:
         resolved = player.set_repeat_mode(mode)
     console.print(f"[bold bright_magenta]\\[REPEAT: {resolved.upper()}][/bold bright_magenta]")
+    return 0
+
+
+def _cmd_eq(args: argparse.Namespace) -> int:
+    player = MPVPlayer()
+    profile = getattr(args, "profile", "cycle")
+    if profile == "cycle":
+        resolved = player.cycle_sound_profile()
+    else:
+        resolved = player.apply_sound_profile(profile)
+    label = SOUND_PROFILE_LABELS.get(resolved, resolved)
+    console.print(f"[bold bright_green]\\[SOUND EQ][/bold bright_green] {escape(label)}")
     return 0
 
 
@@ -646,6 +669,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Repeat mode (default: cycle)",
     )
     p_repeat.set_defaults(func=_cmd_repeat)
+
+    p_eq = sub.add_parser("eq", help="Cycle or set real-time audio enhancer / EQ profile")
+    p_eq.add_argument(
+        "profile",
+        nargs="?",
+        choices=[*SOUND_PROFILE_CHOICES, "cycle"],
+        default="cycle",
+        help="Sound profile (default: cycle)",
+    )
+    p_eq.set_defaults(func=_cmd_eq)
 
     p_queue = sub.add_parser("queue", help="Display the full playback queue")
     p_queue.set_defaults(func=_cmd_queue)

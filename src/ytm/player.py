@@ -16,7 +16,7 @@ from ytm.config import MPV_SOCKET_PATH, STATE_FILE, ensure_dirs, get_ytdlp_path
 from ytm.liked import LikedStore
 from ytm.models import Track
 from ytm.resolver import StreamResolver
-from ytm.settings import SettingsStore
+from ytm.settings import SOUND_PROFILE_CHOICES, SOUND_PROFILE_FILTERS, SettingsStore
 
 REPEAT_MODES = ("off", "all", "one")
 
@@ -147,6 +147,8 @@ class MPVPlayer:
             "--network-timeout=30",
             "--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=5",
         ]
+        if settings.mpv_af:
+            cmd.append(f"--af={settings.mpv_af}")
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -449,8 +451,9 @@ class MPVPlayer:
 
     def get_status(self) -> dict[str, Any]:
         """Return playback state, timing, volume, active track, and queue details."""
+        sound_profile = self.settings_store.load().sound_profile
         if not self.is_running():
-            return {"running": False}
+            return {"running": False, "sound_profile": sound_profile}
 
         paused = bool(self._get_property("pause", False))
         time_pos = float(self._get_property("time-pos", 0.0) or 0.0)
@@ -487,7 +490,31 @@ class MPVPlayer:
             "radio_autoplay": self.load_radio_autoplay(),
             "shuffle": bool(state.get("shuffle", False)),
             "repeat_mode": repeat_mode,
+            "sound_profile": sound_profile,
         }
+
+    def apply_sound_profile(self, profile: str | None = None) -> str:
+        """Persist and apply a sound_profile EQ/DSP filter chain live to mpv if running."""
+        if profile is not None:
+            normalized = profile.strip().lower()
+            if normalized not in SOUND_PROFILE_CHOICES:
+                raise ValueError(
+                    f"Unsupported sound profile: {profile!r}. Choose from {', '.join(SOUND_PROFILE_CHOICES)}."
+                )
+            settings = self.settings_store.update(sound_profile=normalized)
+        else:
+            settings = self.settings_store.load()
+
+        if self.is_running():
+            self._set_property("af", SOUND_PROFILE_FILTERS.get(settings.sound_profile, ""))
+        return settings.sound_profile
+
+    def cycle_sound_profile(self) -> str:
+        """Cycle through SOUND_PROFILE_CHOICES and apply live to mpv if running."""
+        updated = self.settings_store.cycle("sound_profile")
+        if self.is_running():
+            self._set_property("af", updated.mpv_af)
+        return updated.sound_profile
 
     def toggle_pause(self) -> bool:
         """Toggle pause/resume on the active daemon and return the new pause state."""

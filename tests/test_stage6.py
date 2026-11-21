@@ -337,7 +337,7 @@ def test_tui_settings_page_toggles_and_actions(tmp_path: Path) -> None:
             assert app.active_view == "settings"
             assert settings_table.display is True
             assert track_table.display is False
-            assert settings_table.row_count == 10
+            assert settings_table.row_count == 11
 
             # Row 0: Toggle Auto-Cache Liked Music OFF -> ON -> OFF
             await pilot.press("enter")
@@ -365,8 +365,8 @@ def test_tui_settings_page_toggles_and_actions(tmp_path: Path) -> None:
             await pilot.pause()
             assert settings_store.load().audio_quality == "saver"
 
-            # Row 7: Clear Temp Preload (j past stream_buffer_secs, mpris_enabled, spectrum_mode)
-            await pilot.press("j", "j", "j", "j", "enter")
+            # Row 8: Clear Temp Preload (j past stream_buffer_secs, mpris_enabled, spectrum_mode, sound_profile)
+            await pilot.press("j", "j", "j", "j", "j", "enter")
             await pilot.pause()
             assert not (preload_dir / "temp_song.opus").exists()
 
